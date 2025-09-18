@@ -1,0 +1,4 @@
+dataset/
+.vscode/
+*.pdf
+__pycache__/
