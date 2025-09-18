@@ -271,7 +271,7 @@ def predict_test_set(model, test_csv, test_audio_dir, preprocessor, device='cuda
     # 创建提交文件
     submission = pd.DataFrame({
         'audio_name': audio_names,
-        'prediction': predictions
+        'target': predictions
     })
     
     return submission
@@ -300,7 +300,8 @@ def main():
         n_mels=128,
         n_fft=2048,
         hop_length=512,
-        max_len=5  # 5秒音频
+        max_len=5,  # 5秒音频
+        device=device
     )
     
     # 加载训练数据并划分训练/验证集
@@ -354,7 +355,7 @@ def main():
     trainer = AudioClassificationTrainer(
         model=model,
         device=device,
-        learning_rate=0.001,
+        learning_rate=0.005,
         weight_decay=1e-4
     )
     

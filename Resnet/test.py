@@ -14,12 +14,14 @@ def test_audio_preprocessing():
     print("=== 测试音频预处理 ===")
     
     # 创建预处理器
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     preprocessor = AudioPreprocessor(
         sample_rate=22050,
         n_mels=128,
         n_fft=2048,
         hop_length=512,
-        max_len=5
+        max_len=5,
+        device=device
     )
     
     # 检查是否有音频文件
@@ -97,7 +99,8 @@ def test_dataset():
         print(f"类别分布: {df['target'].value_counts().to_dict()}")
         
         # 创建预处理器
-        preprocessor = AudioPreprocessor(max_len=5)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        preprocessor = AudioPreprocessor(max_len=5, device=device)
         
         # 创建数据集（只测试前几个样本）
         small_df = df.head(5)

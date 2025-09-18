@@ -21,88 +21,86 @@ import seaborn as sns
 class AudioPreprocessor:
     """音频预处理工具类，负责音频加载、特征提取和数据增强"""
     
-    def __init__(self, sample_rate=22050, n_mels=128, n_fft=2048, hop_length=512, max_len=5):
+    def __init__(self, sample_rate=22050, n_mels=128, n_fft=2048, hop_length=512, max_len=5, device=None):
         self.sample_rate = sample_rate
         self.n_mels = n_mels
         self.n_fft = n_fft
         self.hop_length = hop_length
-        self.max_len = max_len  # 最大音频长度（秒）
+        self.max_len = max_len
         self.target_length = int(self.sample_rate * self.max_len / self.hop_length)
-        # 使用 torchaudio 转换加速 Mel 频谱计算
+        self.device = torch.device(device) if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=self.sample_rate,
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             n_mels=self.n_mels
-        )
-        self.db_transform = torchaudio.transforms.AmplitudeToDB()
+        ).to(self.device)
+        self.db_transform = torchaudio.transforms.AmplitudeToDB().to(self.device)
+        self._resamplers = {}
         
     def load_audio(self, file_path):
-        """加载音频文件，返回一维 Tensor"""
+        '''Load audio and resample to the target rate if needed.'''
         try:
             waveform, sr = torchaudio.load(file_path)
-            # 重采样至目标采样率
+            waveform = waveform.to(self.device)
             if sr != self.sample_rate:
-                resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.sample_rate)
+                resampler = self._resamplers.get(sr)
+                if resampler is None:
+                    resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.sample_rate).to(self.device)
+                    self._resamplers[sr] = resampler
                 waveform = resampler(waveform)
-            # 转为单通道
             audio = waveform.mean(dim=0)
             return audio
         except Exception as e:
             print(f"Error loading {file_path}: {e}")
             return None
-    
+
+
     def extract_mel_spectrogram(self, audio):
-        """提取Mel频谱图并转换为对数刻度"""
-        # audio: 1D Tensor of shape [time]
-        # 确保带 channel 维度: [1, time]
-        if audio.dim() == 1:
-            waveform = audio.unsqueeze(0)
-        else:
-            waveform = audio
-        # 若波形长度小于 n_fft，则右侧补齐
+        '''Compute the log-mel spectrogram on the configured device.'''
+        if audio is None:
+            return None
+        waveform = audio.unsqueeze(0) if audio.dim() == 1 else audio
         if waveform.size(1) < self.n_fft:
             pad_size = self.n_fft - waveform.size(1)
             waveform = F.pad(waveform, (0, pad_size))
-        # 计算 Mel 频谱并转为对数刻度
-        mel_spec = self.mel_transform(waveform)        # Tensor [1, n_mels, time]
-        mel_spec_db = self.db_transform(mel_spec)     # Tensor [1, n_mels, time]
-        # 移除 channel 维度
-        mel_spec_db = mel_spec_db.squeeze(0)          # Tensor [n_mels, time]
-        return mel_spec_db.numpy()
-    
+        mel_spec = self.mel_transform(waveform)
+        mel_spec_db = self.db_transform(mel_spec)
+        return mel_spec_db.squeeze(0)
+
+
     def pad_or_trim(self, mel_spec):
-        """填充或截断Mel频谱图到固定长度"""
-        if mel_spec.shape[1] > self.target_length:
-            # 截断
+        '''Pad or trim the spectrogram to the target length.'''
+        if mel_spec.size(1) > self.target_length:
             mel_spec = mel_spec[:, :self.target_length]
-        else:
-            # 填充
-            pad_width = self.target_length - mel_spec.shape[1]
-            mel_spec = np.pad(mel_spec, ((0, 0), (0, pad_width)), mode='constant')
-        
+        elif mel_spec.size(1) < self.target_length:
+            pad_width = self.target_length - mel_spec.size(1)
+            mel_spec = F.pad(mel_spec, (0, pad_width))
         return mel_spec
-    
+
+
     def normalize(self, mel_spec):
-        """标准化Mel频谱图"""
-        # 归一化到[-1, 1]
-        mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-8)
+        '''Standardize the spectrogram.'''
+        mean = mel_spec.mean()
+        std = mel_spec.std(unbiased=False)
+        mel_spec = (mel_spec - mean) / (std + 1e-8)
         return mel_spec
-    
+
+
     def process_audio(self, file_path):
-        """完整的音频处理流程"""
+        '''Full preprocessing pipeline executed on the selected device.'''
         audio = self.load_audio(file_path)
         if audio is None:
             return None
-        
         mel_spec = self.extract_mel_spectrogram(audio)
+        if mel_spec is None:
+            return None
         mel_spec = self.pad_or_trim(mel_spec)
-        mel_spec = self.normalize(mel_spec)
-        
-        # 添加通道维度，转换为类似图像的格式
-        mel_spec = np.expand_dims(mel_spec, axis=0)
-        
-        return torch.FloatTensor(mel_spec)
+        mel_spec = self.normalize(mel_spec).unsqueeze(0).float()
+        if self.device.type != 'cpu':
+            mel_spec = mel_spec.cpu()
+        return mel_spec
+
 
 # 自定义数据集类
 class AudioDataset(Dataset):
