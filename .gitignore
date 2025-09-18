@@ -2,3 +2,6 @@ dataset/
 .vscode/
 *.pdf
 __pycache__/
+/*.csv
+/*.png
+*.pth

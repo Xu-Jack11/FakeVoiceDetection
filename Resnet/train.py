@@ -26,8 +26,8 @@ class AudioClassificationTrainer:
     """音频分类训练器"""
     #学习率
     def __init__(self, model, device='cuda', learning_rate=0.001, weight_decay=1e-4):
-        self.model = model.to(device)
-        self.device = device
+        self.device = torch.device(device) if not isinstance(device, torch.device) else device
+        self.model = model.to(self.device)
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         
@@ -82,7 +82,10 @@ class AudioClassificationTrainer:
         
         avg_loss = total_loss / len(train_loader)
         accuracy = 100. * correct / total
-        
+
+        if self.device.type == 'cuda' and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return avg_loss, accuracy
     
     def validate_epoch(self, val_loader):
@@ -116,7 +119,10 @@ class AudioClassificationTrainer:
         
         avg_loss = total_loss / len(val_loader)
         accuracy = 100. * correct / total
-        
+
+        if self.device.type == 'cuda' and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return avg_loss, accuracy, all_preds, all_targets
     
     def train(self, train_loader, val_loader, epochs=50, save_path='best_model.pth'):
@@ -342,7 +348,7 @@ def main():
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True,
+        persistent_workers=False,
         prefetch_factor=2
     )
     
@@ -363,7 +369,7 @@ def main():
     best_val_acc, best_val_loss = trainer.train(
         train_loader=train_loader,
         val_loader=val_loader,
-        epochs=1,
+        epochs=3,
         save_path='best_audio_model.pth'
     )
     
