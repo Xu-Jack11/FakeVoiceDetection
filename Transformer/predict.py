@@ -12,7 +12,7 @@ from audio_transformer_model import AudioTransformerClassifier,AudioPreprocessor
 
 
 def load_checkpoint(model: torch.nn.Module, checkpoint_path: str, device: torch.device) -> None:
-    state = torch.load(checkpoint_path, map_location=device)
+    state = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if isinstance(state, dict) and "model_state_dict" in state:
         model.load_state_dict(state["model_state_dict"])
     else:
