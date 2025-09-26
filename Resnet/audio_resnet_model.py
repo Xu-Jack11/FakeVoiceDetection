@@ -48,7 +48,8 @@ class AudioPreprocessor:
         self.feature_types = tuple(feature_types)
         self.n_lfcc = n_lfcc if n_lfcc is not None else self.n_mels
         self.cqt_bins_per_octave = cqt_bins_per_octave
-        self.cqt_fmin = cqt_fmin if cqt_fmin is not None else librosa.note_to_hz('C1')
+        self.cqt_fmin = cqt_fmin if cqt_fmin is not None else 32.703195662574764
+        self._target_device_index = self.device.index if self.device.index is not None else 0
         nyquist = self.sample_rate / 2.0
         max_octaves = np.log2(max(nyquist / max(self.cqt_fmin, 1e-6), 1.0))
         max_cqt_bins = int(np.floor(max_octaves * self.cqt_bins_per_octave))
@@ -89,11 +90,42 @@ class AudioPreprocessor:
                 'center': True
             }
         ).to(self.device)
+        self._use_gpu_cqt = hasattr(torchaudio.transforms, 'CQT') and "cqt" in self.feature_types
+        if self._use_gpu_cqt:
+            self.cqt_transform = torchaudio.transforms.CQT(
+                sr=self.sample_rate,
+                hop_length=self.hop_length,
+                fmin=self.cqt_fmin,
+                n_bins=self.cqt_bins,
+                bins_per_octave=self.cqt_bins_per_octave,
+                filter_scale=self.cqt_filter_scale,
+            ).to(self.device)
+            self.cqt_db_transform = torchaudio.transforms.AmplitudeToDB(stype='magnitude').to(self.device)
+        else:
+            if "cqt" in self.feature_types:
+                warnings.warn(
+                    "torchaudio.transforms.CQT 不可用，将退回到 librosa CPU 实现。",
+                    RuntimeWarning,
+                    stacklevel=2
+                )
+            self.cqt_transform = None
+            self.cqt_db_transform = None
         self._resamplers = {}
+
+    def _ensure_device_context(self):
+        if self.device.type != 'cuda':
+            return
+        if torch.cuda.device_count() <= self._target_device_index:
+            raise RuntimeError(
+                f"Requested CUDA device index {self._target_device_index} but only {torch.cuda.device_count()} devices available."
+            )
+        if not torch.cuda.is_initialized() or torch.cuda.current_device() != self._target_device_index:
+            torch.cuda.set_device(self._target_device_index)
         
     def load_audio(self, file_path):
         '''Load audio and resample to the target rate if needed.'''
         try:
+            self._ensure_device_context()
             if self._load_with_torchcodec is not None:
                 try:
                     waveform, sr = self._load_with_torchcodec(file_path)
@@ -161,8 +193,18 @@ class AudioPreprocessor:
         """Compute Constant-Q Transform magnitude in dB."""
         if audio is None:
             return None
-        audio_np = audio.detach().cpu().numpy()
         try:
+            if self._use_gpu_cqt and self.cqt_transform is not None:
+                waveform = audio.unsqueeze(0) if audio.dim() == 1 else audio
+                if waveform.dim() == 3:
+                    waveform = waveform.mean(dim=1)
+                if waveform.dim() == 1:
+                    waveform = waveform.unsqueeze(0)
+                cqt = self.cqt_transform(waveform)
+                cqt_mag = torch.abs(cqt)
+                cqt_db = self.cqt_db_transform(cqt_mag)
+                return cqt_db.squeeze(0)
+            audio_np = audio.detach().cpu().numpy()
             cqt = librosa.cqt(
                 audio_np,
                 sr=self.sample_rate,
@@ -177,7 +219,7 @@ class AudioPreprocessor:
             cqt_mag = np.abs(cqt)
             ref = np.max(cqt_mag) if np.max(cqt_mag) > 0 else 1.0
             cqt_db = librosa.amplitude_to_db(cqt_mag, ref=ref)
-            return torch.from_numpy(cqt_db).float()
+            return torch.from_numpy(cqt_db).float().to(self.device)
         except Exception as e:
             print(f"Error computing CQT: {e}")
             return None
@@ -206,6 +248,7 @@ class AudioPreprocessor:
         audio = self.load_audio(file_path)
         if audio is None:
             return None
+        self._ensure_device_context()
         feature_tensors = []
         for feature_name in self.feature_types:
             if feature_name == "mel":
@@ -235,8 +278,8 @@ class AudioPreprocessor:
         if not feature_tensors:
             return None
 
-        features = torch.stack(feature_tensors, dim=0).float()
-        if self.device.type != 'cpu':
+        features = torch.stack(feature_tensors, dim=0).float().contiguous()
+        if features.device.type != 'cpu':
             features = features.cpu()
         return features
 

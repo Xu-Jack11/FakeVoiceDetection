@@ -66,7 +66,8 @@ class AudioClassificationTrainer:
         
         train_bar = tqdm(train_loader, desc='Training')
         for batch_idx, (data, target) in enumerate(train_bar):
-            data, target = data.to(self.device), target.to(self.device)
+            data = data.to(self.device, non_blocking=True)
+            target = target.to(self.device, non_blocking=True)
             
             self.optimizer.zero_grad(set_to_none=True)
             with autocast('cuda',enabled=self.use_amp):
@@ -108,7 +109,8 @@ class AudioClassificationTrainer:
         with torch.no_grad():
             val_bar = tqdm(val_loader, desc='Validation')
             for data, target in val_bar:
-                data, target = data.to(self.device), target.to(self.device)
+                data = data.to(self.device, non_blocking=True)
+                target = target.to(self.device, non_blocking=True)
                 with autocast('cuda',enabled=self.use_amp):
                     output = self.model(data)
                     loss = self.criterion(output, target)
@@ -235,7 +237,8 @@ def evaluate_model(model, test_loader, device='cuda'):
     with torch.no_grad():
         test_bar = tqdm(test_loader, desc='Testing')
         for data, target in test_bar:
-            data, target = data.to(device), target.to(device)
+            data = data.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
             output = model(data)
             probs = torch.softmax(output, dim=1)
             pred = output.argmax(dim=1)
@@ -263,7 +266,15 @@ def predict_test_set(model, test_csv, test_audio_dir, preprocessor, device='cuda
     """对测试集进行预测"""
     # 创建测试数据集（无标签）
     test_dataset = AudioDataset(test_csv, test_audio_dir, preprocessor)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    test_num_workers = 4
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=test_num_workers,
+        pin_memory=True,
+        persistent_workers=test_num_workers > 0
+    )
     
     model.eval()
     predictions = []
@@ -272,7 +283,7 @@ def predict_test_set(model, test_csv, test_audio_dir, preprocessor, device='cuda
     with torch.no_grad():
         test_bar = tqdm(test_loader, desc='Predicting')
         for data, names in test_bar:
-            data = data.to(device)
+            data = data.to(device, non_blocking=True)
             with autocast('cuda',enabled=device.type == 'cuda'):
                 output = model(data)
             probs = torch.softmax(output, dim=1)
@@ -343,13 +354,14 @@ def main():
     batch_size = 32  # 根据GPU内存调整
     # DataLoader 优化：多进程加载、预取、固定内存
     num_workers = 8
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=False,
-        persistent_workers=False,
+        pin_memory=True,
+        persistent_workers=True,
         prefetch_factor=3
     )
     val_loader = DataLoader(
@@ -358,7 +370,7 @@ def main():
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=False,
+        persistent_workers=True,
         prefetch_factor=2
     )
     

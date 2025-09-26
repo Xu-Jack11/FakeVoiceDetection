@@ -47,7 +47,7 @@ def predict(model: torch.nn.Module, loader: DataLoader, device: torch.device) ->
 
     with torch.no_grad():
         for data, names in tqdm(loader, desc="Predicting"):
-            data = data.to(device)
+            data = data.to(device, non_blocking=True)
             with autocast(enabled=device.type == "cuda"):
                 output = model(data)
             pred = output.argmax(dim=1)
@@ -107,7 +107,7 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
-        persistent_workers=False,
+        persistent_workers=args.num_workers > 0,
     )
 
     model = build_model(args.model, device, preprocessor.feature_channels)
