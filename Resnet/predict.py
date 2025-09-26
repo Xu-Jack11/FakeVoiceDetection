@@ -16,6 +16,7 @@ from audio_resnet_model import (
     AudioResNet34,
     AudioResNet50,
 )
+from torch.cuda.amp import autocast
 
 MODEL_REGISTRY: Dict[str, Type[torch.nn.Module]] = {
     "resnet18": AudioResNet18,
@@ -24,10 +25,10 @@ MODEL_REGISTRY: Dict[str, Type[torch.nn.Module]] = {
 }
 
 
-def build_model(name: str, device: torch.device) -> torch.nn.Module:
+def build_model(name: str, device: torch.device, input_channels: int) -> torch.nn.Module:
     if name not in MODEL_REGISTRY:
         raise ValueError(f"Unknown model '{name}'. Choices: {list(MODEL_REGISTRY)}")
-    model = MODEL_REGISTRY[name](num_classes=2)
+    model = MODEL_REGISTRY[name](num_classes=2, input_channels=input_channels)
     return model.to(device)
 
 
@@ -47,7 +48,8 @@ def predict(model: torch.nn.Module, loader: DataLoader, device: torch.device) ->
     with torch.no_grad():
         for data, names in tqdm(loader, desc="Predicting"):
             data = data.to(device)
-            output = model(data)
+            with autocast(enabled=device.type == "cuda"):
+                output = model(data)
             pred = output.argmax(dim=1)
 
             predictions.extend(pred.cpu().tolist())
@@ -108,7 +110,7 @@ def main() -> None:
         persistent_workers=False,
     )
 
-    model = build_model(args.model, device)
+    model = build_model(args.model, device, preprocessor.feature_channels)
     load_checkpoint(model, args.checkpoint, device)
 
     submission = predict(model, loader, device)

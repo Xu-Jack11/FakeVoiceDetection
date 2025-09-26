@@ -21,6 +21,7 @@ warnings.filterwarnings('ignore')
 from audio_resnet_model import (
     AudioPreprocessor, AudioDataset, AudioResNet18, AudioResNet34, AudioResNet50
 )
+from torch.amp import autocast, GradScaler
 
 class AudioClassificationTrainer:
     """音频分类训练器"""
@@ -40,6 +41,10 @@ class AudioClassificationTrainer:
             lr=learning_rate, 
             weight_decay=weight_decay
         )
+        
+        # 混合精度配置
+        self.use_amp = self.device.type == 'cuda'
+        self.scaler = GradScaler('cuda',enabled=self.use_amp)
         
         # 学习率调度器
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -63,20 +68,23 @@ class AudioClassificationTrainer:
         for batch_idx, (data, target) in enumerate(train_bar):
             data, target = data.to(self.device), target.to(self.device)
             
-            self.optimizer.zero_grad()
-            output = self.model(data)
-            loss = self.criterion(output, target)
-            loss.backward()
-            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            with autocast('cuda',enabled=self.use_amp):
+                output = self.model(data)
+                loss = self.criterion(output, target)
+            loss_value = loss.item()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             
-            total_loss += loss.item()
-            pred = output.argmax(dim=1, keepdim=True)
+            total_loss += loss_value
+            pred = output.detach().argmax(dim=1, keepdim=True)
             correct += pred.eq(target.view_as(pred)).sum().item()
             total += target.size(0)
             
             # 更新进度条
             train_bar.set_postfix({
-                'Loss': f'{loss.item():.4f}',
+                'Loss': f'{loss_value:.4f}',
                 'Acc': f'{100.*correct/total:.2f}%'
             })
         
@@ -101,8 +109,9 @@ class AudioClassificationTrainer:
             val_bar = tqdm(val_loader, desc='Validation')
             for data, target in val_bar:
                 data, target = data.to(self.device), target.to(self.device)
-                output = self.model(data)
-                loss = self.criterion(output, target)
+                with autocast('cuda',enabled=self.use_amp):
+                    output = self.model(data)
+                    loss = self.criterion(output, target)
                 
                 total_loss += loss.item()
                 pred = output.argmax(dim=1, keepdim=True)
@@ -264,7 +273,8 @@ def predict_test_set(model, test_csv, test_audio_dir, preprocessor, device='cuda
         test_bar = tqdm(test_loader, desc='Predicting')
         for data, names in test_bar:
             data = data.to(device)
-            output = model(data)
+            with autocast('cuda',enabled=device.type == 'cuda'):
+                output = model(data)
             probs = torch.softmax(output, dim=1)
             pred = output.argmax(dim=1)
             
@@ -353,7 +363,10 @@ def main():
     )
     
     # 创建模型（可以选择不同的ResNet变体）
-    model = AudioResNet18(num_classes=2)  # 也可以尝试AudioResNet34, AudioResNet50
+    model = AudioResNet18(
+        num_classes=2,
+        input_channels=preprocessor.feature_channels
+    )  # 也可以尝试AudioResNet34, AudioResNet50
     
     print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
     
@@ -361,7 +374,7 @@ def main():
     trainer = AudioClassificationTrainer(
         model=model,
         device=device,
-        learning_rate=0.005,
+        learning_rate=0.001,
         weight_decay=1e-4
     )
     
@@ -422,4 +435,6 @@ def main():
     print("\n训练和评估完成!")
 
 if __name__ == "__main__":
+    import torch.multiprocessing as mp
+    mp.set_start_method('spawn', force=True)
     main()

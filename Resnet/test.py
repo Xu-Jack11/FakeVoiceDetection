@@ -33,9 +33,9 @@ def test_audio_preprocessing():
             print(f"测试文件: {test_file}")
             
             # 处理音频
-            mel_spec = preprocessor.process_audio(test_file)
-            if mel_spec is not None:
-                print(f"Mel频谱图形状: {mel_spec.shape}")
+            features = preprocessor.process_audio(test_file)
+            if features is not None:
+                print(f"多通道特征形状: {features.shape}")
                 print("✓ 音频预处理测试通过")
                 return True
             else:
@@ -53,19 +53,23 @@ def test_model_creation():
     print("\n=== 测试模型创建 ===")
     
     try:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # 创建预处理器以获取输入尺寸
+        preprocessor = AudioPreprocessor(max_len=5, device=device)
+        channels = preprocessor.feature_channels
+        time_steps = preprocessor.target_length
+
         # 创建模型
-        model = AudioResNet18(num_classes=2)
+        model = AudioResNet18(num_classes=2, input_channels=channels)
         print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
         
         # 测试前向传播
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model = model.to(device)
         
         # 创建假输入
         batch_size = 4
-        n_mels = 128
-        time_steps = 216  # 大约5秒音频的时间步数
-        dummy_input = torch.randn(batch_size, 1, n_mels, time_steps).to(device)
+        n_mels = preprocessor.n_mels
+        dummy_input = torch.randn(batch_size, channels, n_mels, time_steps).to(device)
         
         model.eval()
         with torch.no_grad():
@@ -114,11 +118,11 @@ def test_dataset():
         try:
             sample = dataset[0]
             if len(sample) == 2:  # 有标签
-                mel_spec, label = sample
-                print(f"样本0 - Mel频谱图形状: {mel_spec.shape}, 标签: {label}")
+                features, label = sample
+                print(f"样本0 - 特征形状: {features.shape}, 标签: {label}")
             else:  # 无标签（测试集）
-                mel_spec = sample
-                print(f"样本0 - Mel频谱图形状: {mel_spec.shape}")
+                features = sample
+                print(f"样本0 - 特征形状: {features.shape}")
             
             print("✓ 数据集加载测试通过")
             
@@ -143,9 +147,14 @@ def test_training_loop():
     try:
         from train import AudioClassificationTrainer
         
-        # 创建模型
-        model = AudioResNet18(num_classes=2)
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        preprocessor = AudioPreprocessor(max_len=5, device=device)
+
+        # 创建模型
+        model = AudioResNet18(
+            num_classes=2,
+            input_channels=preprocessor.feature_channels
+        )
         
         # 创建训练器
         trainer = AudioClassificationTrainer(

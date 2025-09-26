@@ -3,6 +3,8 @@
 使用Mel频谱图作为输入特征，通过深度学习识别真人声音和AI生成声音
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,7 +23,21 @@ import seaborn as sns
 class AudioPreprocessor:
     """音频预处理工具类，负责音频加载、特征提取和数据增强"""
     
-    def __init__(self, sample_rate=22050, n_mels=128, n_fft=2048, hop_length=512, max_len=5, device=None):
+    def __init__(
+        self,
+        sample_rate=22050,
+        n_mels=128,
+        n_fft=2048,
+        hop_length=512,
+        max_len=5,
+        device=None,
+        feature_types=("mel", "lfcc", "cqt"),
+        n_lfcc=None,
+        cqt_bins=None,
+        cqt_filter_scale=1.0,
+        cqt_bins_per_octave=12,
+        cqt_fmin=None,
+    ):
         self.sample_rate = sample_rate
         self.n_mels = n_mels
         self.n_fft = n_fft
@@ -29,6 +45,28 @@ class AudioPreprocessor:
         self.max_len = max_len
         self.target_length = int(self.sample_rate * self.max_len / self.hop_length)
         self.device = torch.device(device) if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.feature_types = tuple(feature_types)
+        self.n_lfcc = n_lfcc if n_lfcc is not None else self.n_mels
+        self.cqt_bins_per_octave = cqt_bins_per_octave
+        self.cqt_fmin = cqt_fmin if cqt_fmin is not None else librosa.note_to_hz('C1')
+        nyquist = self.sample_rate / 2.0
+        max_octaves = np.log2(max(nyquist / max(self.cqt_fmin, 1e-6), 1.0))
+        max_cqt_bins = int(np.floor(max_octaves * self.cqt_bins_per_octave))
+        if max_cqt_bins <= 0:
+            max_cqt_bins = self.cqt_bins_per_octave
+        desired_cqt_bins = cqt_bins if cqt_bins is not None else self.n_mels
+        if desired_cqt_bins > max_cqt_bins:
+            warnings.warn(
+                f"Requested CQT bins {desired_cqt_bins} exceed Nyquist limit; clipping to {max_cqt_bins}.",
+                UserWarning,
+                stacklevel=2
+            )
+            desired_cqt_bins = max_cqt_bins
+        self.cqt_bins = max(desired_cqt_bins, 1)
+        self.cqt_filter_scale = cqt_filter_scale
+        self.feature_channels = len(self.feature_types)
+        self._load_with_torchcodec = getattr(torchaudio, 'load_with_torchcodec', None)
+        self._torchcodec_warned = False
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=self.sample_rate,
             n_fft=self.n_fft,
@@ -36,12 +74,45 @@ class AudioPreprocessor:
             n_mels=self.n_mels
         ).to(self.device)
         self.db_transform = torchaudio.transforms.AmplitudeToDB().to(self.device)
+        self.lfcc_transform = torchaudio.transforms.LFCC(
+            sample_rate=self.sample_rate,
+            n_filter=self.n_lfcc,
+            f_min=0.0,
+            f_max=nyquist,
+            n_lfcc=self.n_lfcc,
+            dct_type=2,
+            norm='ortho',
+            log_lf=True,
+            speckwargs={
+                'n_fft': self.n_fft,
+                'hop_length': self.hop_length,
+                'center': True
+            }
+        ).to(self.device)
         self._resamplers = {}
         
     def load_audio(self, file_path):
         '''Load audio and resample to the target rate if needed.'''
         try:
-            waveform, sr = torchaudio.load(file_path)
+            if self._load_with_torchcodec is not None:
+                try:
+                    waveform, sr = self._load_with_torchcodec(file_path)
+                except Exception as err:
+                    if not self._torchcodec_warned:
+                        warnings.warn(
+                            "torchaudio.load_with_torchcodec failed; falling back to torchaudio.load."
+                            " Install torchcodec for best performance.",
+                            RuntimeWarning,
+                            stacklevel=2
+                        )
+                        self._torchcodec_warned = True
+                    waveform, sr = torchaudio.load(file_path)
+            else:
+                waveform, sr = torchaudio.load(file_path)
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            return None
+        try:
             waveform = waveform.to(self.device)
             if sr != self.sample_rate:
                 resampler = self._resamplers.get(sr)
@@ -69,6 +140,49 @@ class AudioPreprocessor:
         return mel_spec_db.squeeze(0)
 
 
+    def extract_lfcc(self, audio):
+        """Compute Linear Frequency Cepstral Coefficients."""
+        if audio is None:
+            return None
+        waveform = audio.unsqueeze(0) if audio.dim() == 1 else audio
+        if waveform.dim() == 3:
+            waveform = waveform.mean(dim=1)
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+        try:
+            lfcc = self.lfcc_transform(waveform)
+            return lfcc.squeeze(0)
+        except Exception as e:
+            print(f"Error computing LFCC: {e}")
+            return None
+
+
+    def extract_cqt(self, audio):
+        """Compute Constant-Q Transform magnitude in dB."""
+        if audio is None:
+            return None
+        audio_np = audio.detach().cpu().numpy()
+        try:
+            cqt = librosa.cqt(
+                audio_np,
+                sr=self.sample_rate,
+                hop_length=self.hop_length,
+                fmin=self.cqt_fmin,
+                n_bins=self.cqt_bins,
+                bins_per_octave=self.cqt_bins_per_octave,
+                filter_scale=self.cqt_filter_scale,
+            )
+            if cqt.size == 0:
+                return None
+            cqt_mag = np.abs(cqt)
+            ref = np.max(cqt_mag) if np.max(cqt_mag) > 0 else 1.0
+            cqt_db = librosa.amplitude_to_db(cqt_mag, ref=ref)
+            return torch.from_numpy(cqt_db).float()
+        except Exception as e:
+            print(f"Error computing CQT: {e}")
+            return None
+
+
     def pad_or_trim(self, mel_spec):
         '''Pad or trim the spectrogram to the target length.'''
         if mel_spec.size(1) > self.target_length:
@@ -92,14 +206,39 @@ class AudioPreprocessor:
         audio = self.load_audio(file_path)
         if audio is None:
             return None
-        mel_spec = self.extract_mel_spectrogram(audio)
-        if mel_spec is None:
+        feature_tensors = []
+        for feature_name in self.feature_types:
+            if feature_name == "mel":
+                spec = self.extract_mel_spectrogram(audio)
+                expected_bins = self.n_mels
+            elif feature_name == "lfcc":
+                spec = self.extract_lfcc(audio)
+                expected_bins = self.n_lfcc
+            elif feature_name == "cqt":
+                spec = self.extract_cqt(audio)
+                expected_bins = self.cqt_bins
+            else:
+                raise ValueError(f"Unsupported feature type: {feature_name}")
+
+            if spec is None:
+                spec = torch.zeros(expected_bins, self.target_length, device=self.device)
+            else:
+                spec = spec.to(self.device)
+            if spec.size(0) != self.n_mels:
+                spec = spec.unsqueeze(0).unsqueeze(0)
+                spec = F.interpolate(spec, size=(self.n_mels, spec.size(-1)), mode='bilinear', align_corners=False)
+                spec = spec.squeeze(0).squeeze(0)
+            spec = self.pad_or_trim(spec)
+            spec = self.normalize(spec)
+            feature_tensors.append(spec)
+
+        if not feature_tensors:
             return None
-        mel_spec = self.pad_or_trim(mel_spec)
-        mel_spec = self.normalize(mel_spec).unsqueeze(0).float()
+
+        features = torch.stack(feature_tensors, dim=0).float()
         if self.device.type != 'cpu':
-            mel_spec = mel_spec.cpu()
-        return mel_spec
+            features = features.cpu()
+        return features
 
 
 # 自定义数据集类
@@ -123,19 +262,23 @@ class AudioDataset(Dataset):
         audio_path = os.path.join(self.audio_dir, audio_name)
         
         # 处理音频
-        mel_spec = self.preprocessor.process_audio(audio_path)
+        features = self.preprocessor.process_audio(audio_path)
         
-        if mel_spec is None:
+        if features is None:
             # 如果音频加载失败，返回零张量
-            mel_spec = torch.zeros(1, self.preprocessor.n_mels, self.preprocessor.target_length)
+            features = torch.zeros(
+                self.preprocessor.feature_channels,
+                self.preprocessor.n_mels,
+                self.preprocessor.target_length
+            )
         
         # 获取标签（如果存在）
         if 'target' in self.data.columns:
             label = self.data.iloc[idx]['target']
             label = torch.tensor(label, dtype=torch.long)
-            return mel_spec, label
+            return features, label
         else:
-            return mel_spec, audio_name
+            return features, audio_name
 
 # ResNet基础块
 class BasicBlock(nn.Module):
@@ -244,22 +387,22 @@ class AudioResNet(nn.Module):
         return out
 
 # 预定义的ResNet变体
-def AudioResNet18(num_classes=2):
+def AudioResNet18(num_classes=2, input_channels=1):
     """ResNet-18 for audio classification"""
-    return AudioResNet(BasicBlock, [2, 2, 2, 2], num_classes)
+    return AudioResNet(BasicBlock, [2, 2, 2, 2], num_classes, input_channels)
 
-def AudioResNet34(num_classes=2):
+def AudioResNet34(num_classes=2, input_channels=1):
     """ResNet-34 for audio classification"""
-    return AudioResNet(BasicBlock, [3, 4, 6, 3], num_classes)
+    return AudioResNet(BasicBlock, [3, 4, 6, 3], num_classes, input_channels)
 
-def AudioResNet50(num_classes=2):
+def AudioResNet50(num_classes=2, input_channels=1):
     """ResNet-50 for audio classification"""
-    return AudioResNet(Bottleneck, [3, 4, 6, 3], num_classes)
+    return AudioResNet(Bottleneck, [3, 4, 6, 3], num_classes, input_channels)
 
-def AudioResNet101(num_classes=2):
+def AudioResNet101(num_classes=2, input_channels=1):
     """ResNet-101 for audio classification"""
-    return AudioResNet(Bottleneck, [3, 4, 23, 3], num_classes)
+    return AudioResNet(Bottleneck, [3, 4, 23, 3], num_classes, input_channels)
 
-def AudioResNet152(num_classes=2):
+def AudioResNet152(num_classes=2, input_channels=1):
     """ResNet-152 for audio classification"""
-    return AudioResNet(Bottleneck, [3, 8, 36, 3], num_classes)
+    return AudioResNet(Bottleneck, [3, 8, 36, 3], num_classes, input_channels)

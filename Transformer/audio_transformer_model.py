@@ -3,14 +3,16 @@ Transformer-based audio classification models.
 """
 
 import math
-import torch
-import torch.nn as nn
 import os
+import warnings
 from typing import Optional
-import torch.nn.functional as F
-import torchaudio
+
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchaudio
 from torch.utils.data import Dataset
 
 class PositionalEncoding(nn.Module):
@@ -152,11 +154,31 @@ class AudioPreprocessor:
         ).to(self.device)
         self.db_transform = torchaudio.transforms.AmplitudeToDB().to(self.device)
         self._resamplers: dict[int, torchaudio.transforms.Resample] = {}
+        self._load_with_torchcodec = getattr(torchaudio, "load_with_torchcodec", None)
+        self._torchcodec_warned = False
 
     def load_audio(self, file_path: str) -> Optional[torch.Tensor]:
         """Load audio and resample to the configured sample rate."""
         try:
-            waveform, sr = torchaudio.load(file_path)
+            if self._load_with_torchcodec is not None:
+                try:
+                    waveform, sr = self._load_with_torchcodec(file_path)
+                except Exception as exc:
+                    if not self._torchcodec_warned:
+                        warnings.warn(
+                            "torchaudio.load_with_torchcodec failed; falling back to torchaudio.load."
+                            " Install torchcodec for best performance.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                        self._torchcodec_warned = True
+                    waveform, sr = torchaudio.load(file_path)
+            else:
+                waveform, sr = torchaudio.load(file_path)
+        except Exception as exc:
+            print(f"Error loading {file_path}: {exc}")
+            return None
+        try:
             waveform = waveform.to(self.device)
             if sr != self.sample_rate:
                 resampler = self._resamplers.get(sr)
