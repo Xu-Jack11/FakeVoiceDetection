@@ -5,6 +5,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.amp as amp
 from torch.utils.data import DataLoader
 import numpy as np
 import pandas as pd
@@ -25,11 +26,17 @@ from audio_resnet_model import (
 class AudioClassificationTrainer:
     """音频分类训练器"""
     #学习率
-    def __init__(self, model, device='cuda', learning_rate=0.001, weight_decay=1e-4):
+    def __init__(self, model, device='cuda', learning_rate=0.001, weight_decay=1e-4, use_mixed_precision=True):
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
         self.model = model.to(self.device)
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.use_amp = (
+            self.device.type == 'cuda'
+            and torch.cuda.is_available()
+            and use_mixed_precision
+        )
+        self.scaler = amp.GradScaler(enabled=self.use_amp)
         
         # 损失函数
         self.criterion = nn.CrossEntropyLoss()
@@ -63,11 +70,13 @@ class AudioClassificationTrainer:
         for batch_idx, (data, target) in enumerate(train_bar):
             data, target = data.to(self.device), target.to(self.device)
             
-            self.optimizer.zero_grad()
-            output = self.model(data)
-            loss = self.criterion(output, target)
-            loss.backward()
-            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            with amp.autocast('cuda',enabled=self.use_amp):
+                output = self.model(data)
+                loss = self.criterion(output, target)
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             
             total_loss += loss.item()
             pred = output.argmax(dim=1, keepdim=True)
@@ -101,8 +110,9 @@ class AudioClassificationTrainer:
             val_bar = tqdm(val_loader, desc='Validation')
             for data, target in val_bar:
                 data, target = data.to(self.device), target.to(self.device)
-                output = self.model(data)
-                loss = self.criterion(output, target)
+                with amp.autocast('cuda',enabled=self.use_amp):
+                    output = self.model(data)
+                    loss = self.criterion(output, target)
                 
                 total_loss += loss.item()
                 pred = output.argmax(dim=1, keepdim=True)
@@ -134,6 +144,7 @@ class AudioClassificationTrainer:
         
         print(f"Starting training for {epochs} epochs...")
         print(f"Device: {self.device}")
+        print(f"Mixed Precision: {'Enabled' if self.use_amp else 'Disabled'}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         
         for epoch in range(epochs):
@@ -218,7 +229,10 @@ class AudioClassificationTrainer:
 
 def evaluate_model(model, test_loader, device='cuda'):
     """评估模型性能"""
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+    model = model.to(device)
     model.eval()
+    use_amp = device.type == 'cuda' and torch.cuda.is_available()
     all_preds = []
     all_targets = []
     all_probs = []
@@ -227,8 +241,9 @@ def evaluate_model(model, test_loader, device='cuda'):
         test_bar = tqdm(test_loader, desc='Testing')
         for data, target in test_bar:
             data, target = data.to(device), target.to(device)
-            output = model(data)
-            probs = torch.softmax(output, dim=1)
+            with amp.autocast('cuda',enabled=use_amp):
+                output = model(data)
+                probs = torch.softmax(output, dim=1)
             pred = output.argmax(dim=1)
             
             all_preds.extend(pred.cpu().numpy())
@@ -252,10 +267,13 @@ def plot_confusion_matrix(y_true, y_pred, save_path='confusion_matrix.png'):
 
 def predict_test_set(model, test_csv, test_audio_dir, preprocessor, device='cuda', batch_size=32):
     """对测试集进行预测"""
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+    use_amp = device.type == 'cuda' and torch.cuda.is_available()
     # 创建测试数据集（无标签）
     test_dataset = AudioDataset(test_csv, test_audio_dir, preprocessor)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
     
+    model = model.to(device)
     model.eval()
     predictions = []
     audio_names = []
@@ -264,8 +282,9 @@ def predict_test_set(model, test_csv, test_audio_dir, preprocessor, device='cuda
         test_bar = tqdm(test_loader, desc='Predicting')
         for data, names in test_bar:
             data = data.to(device)
-            output = model(data)
-            probs = torch.softmax(output, dim=1)
+            with amp.autocast('cuda',enabled=use_amp):
+                output = model(data)
+                probs = torch.softmax(output, dim=1)
             pred = output.argmax(dim=1)
             
             predictions.extend(pred.cpu().numpy())
