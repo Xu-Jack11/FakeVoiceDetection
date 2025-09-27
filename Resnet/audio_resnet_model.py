@@ -286,14 +286,29 @@ class AudioPreprocessor:
 
 # 自定义数据集类
 class AudioDataset(Dataset):
-    """音频数据集类"""
-    
-    def __init__(self, csv_file, audio_dir, preprocessor, transform=None):
+    """音频数据集类，支持特征缓存"""
+
+    def __init__(
+        self,
+        csv_file,
+        audio_dir,
+        preprocessor,
+        transform=None,
+        feature_cache_dir=None,
+        cache_miss_strategy="compute",
+    ):
         self.data = pd.read_csv(csv_file)
         self.audio_dir = audio_dir
         self.preprocessor = preprocessor
         self.transform = transform
-        
+        self.feature_cache_dir = feature_cache_dir
+        self.cache_miss_strategy = cache_miss_strategy
+        self.feature_channels = getattr(preprocessor, 'feature_channels', None)
+        self.n_mels = getattr(preprocessor, 'n_mels', None)
+        self.target_length = getattr(preprocessor, 'target_length', None)
+        if self.feature_cache_dir is not None:
+            os.makedirs(self.feature_cache_dir, exist_ok=True)
+
     def __len__(self):
         return len(self.data)
     
@@ -303,16 +318,44 @@ class AudioDataset(Dataset):
         
         audio_name = self.data.iloc[idx]['audio_name']
         audio_path = os.path.join(self.audio_dir, audio_name)
-        
-        # 处理音频
-        features = self.preprocessor.process_audio(audio_path)
+        cache_path = None
+        if self.feature_cache_dir is not None:
+            base_name = os.path.splitext(os.path.basename(audio_name))[0]
+            cache_path = os.path.join(self.feature_cache_dir, f"{base_name}.pt")
+
+        features = None
+        if cache_path is not None and os.path.isfile(cache_path):
+            features = torch.load(cache_path, map_location='cpu')
+            if isinstance(features, torch.Tensor):
+                features = features.float()
+                self.feature_channels = features.size(0)
+                if features.dim() >= 2:
+                    self.n_mels = features.size(1)
+                if features.dim() >= 3:
+                    self.target_length = features.size(2)
+        else:
+            if self.preprocessor is None:
+                if self.cache_miss_strategy == 'error':
+                    raise FileNotFoundError(f"特征缓存缺失: {cache_path}")
+                raise RuntimeError("未提供预处理器，无法生成特征。")
+            features = self.preprocessor.process_audio(audio_path)
+            if isinstance(features, torch.Tensor):
+                features = features.float()
+            if features is not None and cache_path is not None and self.cache_miss_strategy != 'load':
+                tmp_path = cache_path + '.tmp'
+                torch.save(features, tmp_path)
+                os.replace(tmp_path, cache_path)
+            elif features is None and self.cache_miss_strategy == 'error':
+                raise FileNotFoundError(f"无法为 {audio_name} 生成特征且未找到缓存。")
         
         if features is None:
             # 如果音频加载失败，返回零张量
+            if self.feature_channels is None or self.n_mels is None or self.target_length is None:
+                raise RuntimeError("无法确定特征形状，且音频加载失败。")
             features = torch.zeros(
-                self.preprocessor.feature_channels,
-                self.preprocessor.n_mels,
-                self.preprocessor.target_length
+                self.feature_channels,
+                self.n_mels,
+                self.target_length
             )
         
         # 获取标签（如果存在）

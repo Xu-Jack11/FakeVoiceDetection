@@ -18,10 +18,37 @@ from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
 
+from pathlib import Path
+
 from audio_resnet_model import (
     AudioPreprocessor, AudioDataset, AudioResNet18, AudioResNet34, AudioResNet50
 )
 from torch.amp import autocast, GradScaler
+
+
+def build_feature_cache(csv_path, audio_dir, cache_dir, preprocessor, overwrite=False):
+    """预取并缓存特征，避免训练时重复计算"""
+    os.makedirs(cache_dir, exist_ok=True)
+    df = pd.read_csv(csv_path)
+    audio_list = df['audio_name'].tolist()
+    cache_progress = tqdm(audio_list, desc=f'Caching -> {Path(cache_dir).name}', leave=False)
+    for audio_name in cache_progress:
+        basename = os.path.splitext(os.path.basename(audio_name))[0]
+        cache_file = os.path.join(cache_dir, f'{basename}.pt')
+        if not overwrite and os.path.isfile(cache_file):
+            continue
+        audio_path = os.path.join(audio_dir, audio_name)
+        features = preprocessor.process_audio(audio_path)
+        if features is None:
+            features = torch.zeros(
+                preprocessor.feature_channels,
+                preprocessor.n_mels,
+                preprocessor.target_length
+            )
+        features = features.float().cpu()
+        tmp_path = cache_file + '.tmp'
+        torch.save(features, tmp_path)
+        os.replace(tmp_path, cache_file)
 
 class AudioClassificationTrainer:
     """音频分类训练器"""
@@ -262,10 +289,25 @@ def plot_confusion_matrix(y_true, y_pred, save_path='confusion_matrix.png'):
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
 
-def predict_test_set(model, test_csv, test_audio_dir, preprocessor, device='cuda', batch_size=32):
+def predict_test_set(
+    model,
+    test_csv,
+    test_audio_dir,
+    preprocessor,
+    device='cuda',
+    batch_size=32,
+    feature_cache_dir=None,
+    cache_miss_strategy='compute'
+):
     """对测试集进行预测"""
     # 创建测试数据集（无标签）
-    test_dataset = AudioDataset(test_csv, test_audio_dir, preprocessor)
+    test_dataset = AudioDataset(
+        test_csv,
+        test_audio_dir,
+        preprocessor,
+        feature_cache_dir=feature_cache_dir,
+        cache_miss_strategy=cache_miss_strategy
+    )
     test_num_workers = 4
     test_loader = DataLoader(
         test_dataset,
@@ -346,9 +388,28 @@ def main():
     train_df.to_csv('temp_train.csv', index=False)
     val_df.to_csv('temp_val.csv', index=False)
     
+    # 预取及缓存特征
+    cache_root = os.path.join('feature_cache', 'resnet')
+    train_cache_dir = os.path.join(cache_root, 'train')
+    val_cache_dir = os.path.join(cache_root, 'val')
+    build_feature_cache('temp_train.csv', train_audio_dir, train_cache_dir, preprocessor)
+    build_feature_cache('temp_val.csv', train_audio_dir, val_cache_dir, preprocessor)
+
     # 创建数据集
-    train_dataset = AudioDataset('temp_train.csv', train_audio_dir, preprocessor)
-    val_dataset = AudioDataset('temp_val.csv', train_audio_dir, preprocessor)
+    train_dataset = AudioDataset(
+        'temp_train.csv',
+        train_audio_dir,
+        preprocessor,
+        feature_cache_dir=train_cache_dir,
+        cache_miss_strategy='error'
+    )
+    val_dataset = AudioDataset(
+        'temp_val.csv',
+        train_audio_dir,
+        preprocessor,
+        feature_cache_dir=val_cache_dir,
+        cache_miss_strategy='error'
+    )
     
     # 创建数据加载器
     batch_size = 32  # 根据GPU内存调整
@@ -427,13 +488,18 @@ def main():
     
     # 对测试集进行预测
     print("\n=== 测试集预测 ===")
+    test_cache_dir = os.path.join(cache_root, 'test')
+    build_feature_cache(test_csv, test_audio_dir, test_cache_dir, preprocessor)
+
     submission = predict_test_set(
         model=model,
         test_csv=test_csv,
         test_audio_dir=test_audio_dir,
         preprocessor=preprocessor,
         device=device,
-        batch_size=batch_size
+        batch_size=batch_size,
+        feature_cache_dir=test_cache_dir,
+        cache_miss_strategy='error'
     )
     
     # 保存预测结果
