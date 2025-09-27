@@ -5,3 +5,4 @@ __pycache__/
 /*.csv
 /*.png
 *.pth
+feature_cache/
