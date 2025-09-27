@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 import time
+from pathlib import Path
 from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
@@ -22,6 +23,7 @@ warnings.filterwarnings('ignore')
 from audio_resnet_model import (
     AudioPreprocessor, AudioDataset, AudioResNet18, AudioResNet34, AudioResNet50
 )
+from cache_mel_features import cache_mel_features
 
 class AudioClassificationTrainer:
     """音频分类训练器"""
@@ -68,7 +70,9 @@ class AudioClassificationTrainer:
         
         train_bar = tqdm(train_loader, desc='Training')
         for batch_idx, (data, target) in enumerate(train_bar):
-            data, target = data.to(self.device), target.to(self.device)
+            non_blocking = self.device.type == 'cuda'
+            data = data.to(self.device, non_blocking=non_blocking)
+            target = target.to(self.device, non_blocking=non_blocking)
             
             self.optimizer.zero_grad(set_to_none=True)
             with amp.autocast('cuda',enabled=self.use_amp):
@@ -109,7 +113,9 @@ class AudioClassificationTrainer:
         with torch.no_grad():
             val_bar = tqdm(val_loader, desc='Validation')
             for data, target in val_bar:
-                data, target = data.to(self.device), target.to(self.device)
+                non_blocking = self.device.type == 'cuda'
+                data = data.to(self.device, non_blocking=non_blocking)
+                target = target.to(self.device, non_blocking=non_blocking)
                 with amp.autocast('cuda',enabled=self.use_amp):
                     output = self.model(data)
                     loss = self.criterion(output, target)
@@ -240,7 +246,9 @@ def evaluate_model(model, test_loader, device='cuda'):
     with torch.no_grad():
         test_bar = tqdm(test_loader, desc='Testing')
         for data, target in test_bar:
-            data, target = data.to(device), target.to(device)
+            non_blocking = device.type == 'cuda'
+            data = data.to(device, non_blocking=non_blocking)
+            target = target.to(device, non_blocking=non_blocking)
             with amp.autocast('cuda',enabled=use_amp):
                 output = model(data)
                 probs = torch.softmax(output, dim=1)
@@ -265,13 +273,27 @@ def plot_confusion_matrix(y_true, y_pred, save_path='confusion_matrix.png'):
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
 
-def predict_test_set(model, test_csv, test_audio_dir, preprocessor, device='cuda', batch_size=32):
+def predict_test_set(model, test_csv, test_audio_dir, preprocessor, device='cuda', batch_size=32, cache_dir=None):
     """对测试集进行预测"""
     device = torch.device(device) if not isinstance(device, torch.device) else device
     use_amp = device.type == 'cuda' and torch.cuda.is_available()
     # 创建测试数据集（无标签）
-    test_dataset = AudioDataset(test_csv, test_audio_dir, preprocessor)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    test_dataset = AudioDataset(
+        test_csv,
+        test_audio_dir,
+        preprocessor,
+        cache_dir=cache_dir,
+    )
+    cpu_count = os.cpu_count() or 1
+    num_workers = min(4, max(1, cpu_count // 2))
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=device.type == 'cuda',
+        persistent_workers=False,
+    )
     
     model = model.to(device)
     model.eval()
@@ -281,7 +303,8 @@ def predict_test_set(model, test_csv, test_audio_dir, preprocessor, device='cuda
     with torch.no_grad():
         test_bar = tqdm(test_loader, desc='Predicting')
         for data, names in test_bar:
-            data = data.to(device)
+            non_blocking = device.type == 'cuda'
+            data = data.to(device, non_blocking=non_blocking)
             with amp.autocast('cuda',enabled=use_amp):
                 output = model(data)
                 probs = torch.softmax(output, dim=1)
@@ -309,8 +332,8 @@ def main():
     
     # 设备配置
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # 启用 cuDNN 自动调优以加速卷积操作（仅在使用 GPU 时有效）
-    torch.backends.cudnn.benchmark = True
+    # 为避免动态输入长度导致的频繁算法搜索，默认关闭 benchmark
+    torch.backends.cudnn.benchmark = False
     print(f"Using device: {device}")
     
     # 数据路径
@@ -325,8 +348,27 @@ def main():
         n_mels=128,
         n_fft=2048,
         hop_length=512,
-        max_len=5,  # 5秒音频
-        device=device
+        max_len=5  # 5秒音频
+    )
+
+    cache_root = Path('cache') / 'mels'
+    train_cache_dir = cache_root / 'train'
+    test_cache_dir = cache_root / 'test'
+
+    print("预缓存训练音频的 Mel 频谱...")
+    cache_mel_features(
+        csv_path=Path(train_csv),
+        audio_dir=Path(train_audio_dir),
+        cache_dir=train_cache_dir,
+        preprocessor=preprocessor,
+    )
+
+    print("预缓存测试音频的 Mel 频谱...")
+    cache_mel_features(
+        csv_path=Path(test_csv),
+        audio_dir=Path(test_audio_dir),
+        cache_dir=test_cache_dir,
+        preprocessor=preprocessor,
     )
     
     # 加载训练数据并划分训练/验证集
@@ -345,30 +387,39 @@ def main():
     val_df.to_csv('temp_val.csv', index=False)
     
     # 创建数据集
-    train_dataset = AudioDataset('temp_train.csv', train_audio_dir, preprocessor)
-    val_dataset = AudioDataset('temp_val.csv', train_audio_dir, preprocessor)
+    train_dataset = AudioDataset(
+        'temp_train.csv',
+        train_audio_dir,
+        preprocessor,
+        cache_dir=train_cache_dir,
+    )
+    val_dataset = AudioDataset(
+        'temp_val.csv',
+        train_audio_dir,
+        preprocessor,
+        cache_dir=train_cache_dir,
+    )
     
     # 创建数据加载器
     batch_size = 64  # 根据GPU内存调整
-    # DataLoader 优化：多进程加载、预取、固定内存
-    num_workers = 12
+    pin_memory = device.type == 'cuda'
+    cpu_count = os.cpu_count() or 1
+    num_workers = min(4, max(1, cpu_count // 2))
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=3
+        pin_memory=pin_memory,
+        persistent_workers=False
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2
+        pin_memory=pin_memory,
+        persistent_workers=False
     )
     
     # 创建模型（可以选择不同的ResNet变体）
@@ -427,7 +478,8 @@ def main():
         test_audio_dir=test_audio_dir,
         preprocessor=preprocessor,
         device=device,
-        batch_size=batch_size
+        batch_size=batch_size,
+        cache_dir=test_cache_dir,
     )
     
     # 保存预测结果

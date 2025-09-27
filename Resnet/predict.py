@@ -2,6 +2,7 @@
 
 import argparse
 import os
+from pathlib import Path
 from typing import Dict, Type
 
 import torch
@@ -16,6 +17,7 @@ from audio_resnet_model import (
     AudioResNet34,
     AudioResNet50,
 )
+from cache_mel_features import cache_mel_features
 
 MODEL_REGISTRY: Dict[str, Type[torch.nn.Module]] = {
     "resnet18": AudioResNet18,
@@ -46,7 +48,7 @@ def predict(model: torch.nn.Module, loader: DataLoader, device: torch.device) ->
 
     with torch.no_grad():
         for data, names in tqdm(loader, desc="Predicting"):
-            data = data.to(device)
+            data = data.to(device, non_blocking=device.type == "cuda")
             output = model(data)
             pred = output.argmax(dim=1)
 
@@ -69,6 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32, help="Prediction batch size")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker count")
     parser.add_argument("--device", default=None, help="Device to run on (e.g., cuda, cpu)")
+    parser.add_argument("--cache-dir", default="cache/mels/test", help="Directory to store/read cached mel features")
     parser.add_argument("--sample-rate", type=int, default=22050)
     parser.add_argument("--n-mels", type=int, default=128)
     parser.add_argument("--n-fft", type=int, default=2048)
@@ -95,15 +98,32 @@ def main() -> None:
         n_fft=args.n_fft,
         hop_length=args.hop_length,
         max_len=args.max_len,
-        device=device,
     )
 
-    dataset = AudioDataset(args.test_csv, args.audio_dir, preprocessor)
+    cache_dir = Path(args.cache_dir)
+    cache_mel_features(
+        csv_path=Path(args.test_csv),
+        audio_dir=Path(args.audio_dir),
+        cache_dir=cache_dir,
+        preprocessor=preprocessor,
+    )
+
+    dataset = AudioDataset(
+        args.test_csv,
+        args.audio_dir,
+        preprocessor,
+        cache_dir=cache_dir,
+    )
+    recommended_workers = min(
+        args.num_workers,
+        max(1, (os.cpu_count() or 1) // 2),
+    )
+
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=recommended_workers,
         pin_memory=device.type == "cuda",
         persistent_workers=False,
     )

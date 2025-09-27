@@ -3,6 +3,9 @@
 使用Mel频谱图作为输入特征，通过深度学习识别真人声音和AI生成声音
 """
 
+import warnings
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,32 +24,62 @@ import seaborn as sns
 class AudioPreprocessor:
     """音频预处理工具类，负责音频加载、特征提取和数据增强"""
     
-    def __init__(self, sample_rate=22050, n_mels=128, n_fft=2048, hop_length=512, max_len=5, device=None):
+    def __init__(
+        self,
+        sample_rate=22050,
+        n_mels=128,
+        n_fft=2048,
+        hop_length=512,
+        max_len=5,
+        device=None,
+    ):
+        """
+        Parameters
+        ----------
+        sample_rate : int
+            目标采样率。
+        device : str | torch.device | None
+            为了向后兼容保留该参数，但音频预处理固定在 CPU 上执行。若传入 GPU 设备，将被忽略。
+        """
+
         self.sample_rate = sample_rate
         self.n_mels = n_mels
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.max_len = max_len
         self.target_length = int(self.sample_rate * self.max_len / self.hop_length)
-        self.device = torch.device(device) if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # 所有预处理步骤统一放在 CPU，避免 DataLoader worker 争抢 GPU 资源
+        self.processing_device = torch.device('cpu')
+        if device is not None:
+            resolved = torch.device(device)
+            if resolved.type != 'cpu':
+                warnings.warn(
+                    "AudioPreprocessor 预处理强制在 CPU 上执行，已忽略传入的 GPU 设备设置。",
+                    RuntimeWarning,
+                )
+
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=self.sample_rate,
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             n_mels=self.n_mels
-        ).to(self.device)
-        self.db_transform = torchaudio.transforms.AmplitudeToDB().to(self.device)
+        )
+        self.db_transform = torchaudio.transforms.AmplitudeToDB()
         self._resamplers = {}
         
     def load_audio(self, file_path):
         '''Load audio and resample to the target rate if needed.'''
         try:
             waveform, sr = torchaudio.load_with_torchcodec(file_path)
-            waveform = waveform.to(self.device)
+            waveform = waveform.to(self.processing_device)
             if sr != self.sample_rate:
                 resampler = self._resamplers.get(sr)
                 if resampler is None:
-                    resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.sample_rate).to(self.device)
+                    resampler = torchaudio.transforms.Resample(
+                        orig_freq=sr,
+                        new_freq=self.sample_rate
+                    ).to(self.processing_device)
                     self._resamplers[sr] = resampler
                 waveform = resampler(waveform)
             audio = waveform.mean(dim=0)
@@ -97,20 +130,30 @@ class AudioPreprocessor:
             return None
         mel_spec = self.pad_or_trim(mel_spec)
         mel_spec = self.normalize(mel_spec).unsqueeze(0).float()
-        if self.device.type != 'cpu':
-            mel_spec = mel_spec.cpu()
         return mel_spec
 
 
 # 自定义数据集类
 class AudioDataset(Dataset):
-    """音频数据集类"""
+    """音频数据集类，支持离线缓存 Mel 频谱图"""
     
-    def __init__(self, csv_file, audio_dir, preprocessor, transform=None):
+    def __init__(
+        self,
+        csv_file,
+        audio_dir,
+        preprocessor,
+        transform=None,
+        cache_dir: str | os.PathLike | None = None,
+        auto_save_cache: bool = True,
+    ):
         self.data = pd.read_csv(csv_file)
         self.audio_dir = audio_dir
         self.preprocessor = preprocessor
         self.transform = transform
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.auto_save_cache = auto_save_cache
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
         
     def __len__(self):
         return len(self.data)
@@ -121,9 +164,27 @@ class AudioDataset(Dataset):
         
         audio_name = self.data.iloc[idx]['audio_name']
         audio_path = os.path.join(self.audio_dir, audio_name)
+
+        mel_spec = None
+        cache_path = None
+        if self.cache_dir is not None:
+            cache_path = self.cache_dir / f"{audio_name}.pt"
+            if cache_path.exists():
+                try:
+                    mel_spec = torch.load(cache_path, map_location='cpu')
+                except Exception as exc:
+                    warnings.warn(f"加载缓存失败 {cache_path}: {exc}")
+                    mel_spec = None
         
-        # 处理音频
-        mel_spec = self.preprocessor.process_audio(audio_path)
+        if mel_spec is None:
+            # 处理音频
+            mel_spec = self.preprocessor.process_audio(audio_path)
+            if mel_spec is not None and self.cache_dir is not None and self.auto_save_cache:
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save(mel_spec, cache_path)
+                except Exception as exc:
+                    warnings.warn(f"写入缓存失败 {cache_path}: {exc}")
         
         if mel_spec is None:
             # 如果音频加载失败，返回零张量
