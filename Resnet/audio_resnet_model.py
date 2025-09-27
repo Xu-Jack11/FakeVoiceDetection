@@ -41,7 +41,7 @@ class AudioPreprocessor:
     def load_audio(self, file_path):
         '''Load audio and resample to the target rate if needed.'''
         try:
-            waveform, sr = torchaudio.load(file_path)
+            waveform, sr = torchaudio.load_with_torchcodec(file_path)
             waveform = waveform.to(self.device)
             if sr != self.sample_rate:
                 resampler = self._resamplers.get(sr)

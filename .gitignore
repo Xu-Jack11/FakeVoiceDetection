@@ -4,4 +4,5 @@ dataset/
 __pycache__/
 /*.csv
 /*.png
+feature_cache/
 *.pth

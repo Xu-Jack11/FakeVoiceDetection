@@ -330,16 +330,16 @@ def main():
     val_dataset = AudioDataset('temp_val.csv', train_audio_dir, preprocessor)
     
     # 创建数据加载器
-    batch_size = 32  # 根据GPU内存调整
+    batch_size = 64  # 根据GPU内存调整
     # DataLoader 优化：多进程加载、预取、固定内存
-    num_workers = 8
+    num_workers = 12
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=False,
-        persistent_workers=False,
+        pin_memory=True,
+        persistent_workers=True,
         prefetch_factor=3
     )
     val_loader = DataLoader(
@@ -348,12 +348,12 @@ def main():
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=False,
+        persistent_workers=True,
         prefetch_factor=2
     )
     
     # 创建模型（可以选择不同的ResNet变体）
-    model = AudioResNet18(num_classes=2)  # 也可以尝试AudioResNet34, AudioResNet50
+    model = AudioResNet50(num_classes=2)  # 也可以尝试AudioResNet34, AudioResNet50
     
     print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
     
@@ -361,7 +361,7 @@ def main():
     trainer = AudioClassificationTrainer(
         model=model,
         device=device,
-        learning_rate=0.005,
+        learning_rate=0.001,
         weight_decay=1e-4
     )
     
@@ -422,4 +422,6 @@ def main():
     print("\n训练和评估完成!")
 
 if __name__ == "__main__":
+    import torch.multiprocessing as mp
+    mp.set_start_method('spawn', force=True)
     main()
