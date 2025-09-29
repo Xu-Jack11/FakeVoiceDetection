@@ -333,7 +333,7 @@ def main():
     # 设备配置
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # 为避免动态输入长度导致的频繁算法搜索，默认关闭 benchmark
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.benchmark = True
     print(f"Using device: {device}")
     
     # 数据路径
@@ -401,10 +401,9 @@ def main():
     )
     
     # 创建数据加载器
-    batch_size = 64  # 根据GPU内存调整
+    batch_size = 32  # 根据GPU内存调整
     pin_memory = device.type == 'cuda'
-    cpu_count = os.cpu_count() or 1
-    num_workers = min(4, max(1, cpu_count // 2))
+    num_workers = 12
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -423,7 +422,7 @@ def main():
     )
     
     # 创建模型（可以选择不同的ResNet变体）
-    model = AudioResNet50(num_classes=2)  # 也可以尝试AudioResNet34, AudioResNet50
+    model = AudioResNet34(num_classes=2)  # 也可以尝试AudioResNet34, AudioResNet50
     
     print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
     
@@ -431,7 +430,7 @@ def main():
     trainer = AudioClassificationTrainer(
         model=model,
         device=device,
-        learning_rate=0.001,
+        learning_rate=0.01,
         weight_decay=1e-4
     )
     
@@ -439,7 +438,7 @@ def main():
     best_val_acc, best_val_loss = trainer.train(
         train_loader=train_loader,
         val_loader=val_loader,
-        epochs=3,
+        epochs=10,
         save_path='best_audio_model.pth'
     )
     
