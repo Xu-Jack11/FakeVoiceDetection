@@ -3,13 +3,10 @@ Transformer-based audio classification models.
 """
 
 import math
-import os
-import warnings
-from pathlib import Path
-from typing import Optional
-
 import torch
 import torch.nn as nn
+import os
+from typing import Optional
 import torch.nn.functional as F
 import torchaudio
 import numpy as np
@@ -142,35 +139,29 @@ class AudioPreprocessor:
         self.hop_length = hop_length
         self.max_len = max_len
         self.target_length = int(self.sample_rate * self.max_len / self.hop_length)
-        self.processing_device = torch.device("cpu")
-        if device is not None:
-            resolved = torch.device(device)
-            if resolved.type != "cpu":
-                warnings.warn(
-                    "AudioPreprocessor 预处理固定在 CPU 上执行，忽略传入的 GPU 设备设置。",
-                    RuntimeWarning,
-                )
-
+        self.device = (
+            torch.device(device)
+            if device is not None and not isinstance(device, torch.device)
+            else (device or torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        )
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=self.sample_rate,
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             n_mels=self.n_mels,
-        )
-        self.db_transform = torchaudio.transforms.AmplitudeToDB()
+        ).to(self.device)
+        self.db_transform = torchaudio.transforms.AmplitudeToDB().to(self.device)
         self._resamplers: dict[int, torchaudio.transforms.Resample] = {}
 
     def load_audio(self, file_path: str) -> Optional[torch.Tensor]:
         """Load audio and resample to the configured sample rate."""
         try:
             waveform, sr = torchaudio.load(file_path)
-            waveform = waveform.to(self.processing_device)
+            waveform = waveform.to(self.device)
             if sr != self.sample_rate:
                 resampler = self._resamplers.get(sr)
                 if resampler is None:
-                    resampler = torchaudio.transforms.Resample(sr, self.sample_rate).to(
-                        self.processing_device
-                    )
+                    resampler = torchaudio.transforms.Resample(sr, self.sample_rate).to(self.device)
                     self._resamplers[sr] = resampler
                 waveform = resampler(waveform)
             audio = waveform.mean(dim=0)
@@ -216,6 +207,8 @@ class AudioPreprocessor:
             return None
         mel_spec = self.pad_or_trim(mel_spec)
         mel_spec = self.normalize(mel_spec).unsqueeze(0).float()
+        if self.device.type != "cpu":
+            mel_spec = mel_spec.cpu()
         return mel_spec
 
 
@@ -227,18 +220,10 @@ class AudioDataset(Dataset):
         csv_file: str,
         audio_dir: str,
         preprocessor: AudioPreprocessor,
-        transform=None,
-        cache_dir: Optional[str | os.PathLike] = None,
-        auto_save_cache: bool = True,
     ) -> None:
         self.data = pd.read_csv(csv_file)
         self.audio_dir = audio_dir
         self.preprocessor = preprocessor
-        self.transform = transform
-        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
-        self.auto_save_cache = auto_save_cache
-        if self.cache_dir is not None:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def __len__(self) -> int:
         return len(self.data)
@@ -246,33 +231,11 @@ class AudioDataset(Dataset):
     def __getitem__(self, idx: int):
         audio_name = self.data.iloc[idx]["audio_name"]
         audio_path = os.path.join(self.audio_dir, audio_name)
-
-        mel_spec = None
-        cache_path = None
-        if self.cache_dir is not None:
-            cache_path = self.cache_dir / f"{audio_name}.pt"
-            if cache_path.exists():
-                try:
-                    mel_spec = torch.load(cache_path, map_location="cpu")
-                except Exception as exc:
-                    warnings.warn(f"加载缓存失败 {cache_path}: {exc}")
-                    mel_spec = None
-
-        if mel_spec is None:
-            mel_spec = self.preprocessor.process_audio(audio_path)
-            if mel_spec is not None and self.cache_dir is not None and self.auto_save_cache:
-                try:
-                    cache_path.parent.mkdir(parents=True, exist_ok=True)
-                    torch.save(mel_spec, cache_path)
-                except Exception as exc:
-                    warnings.warn(f"写入缓存失败 {cache_path}: {exc}")
-
+        mel_spec = self.preprocessor.process_audio(audio_path)
         if mel_spec is None:
             mel_spec = torch.zeros(
                 1, self.preprocessor.n_mels, self.preprocessor.target_length
             )
-        if self.transform is not None:
-            mel_spec = self.transform(mel_spec)
         if "target" in self.data.columns:
             label = int(self.data.iloc[idx]["target"])
             return mel_spec, torch.tensor(label, dtype=torch.long)

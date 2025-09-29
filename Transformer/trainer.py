@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple
 
-import os
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -60,9 +58,8 @@ class AudioClassificationTrainer:
 
         progress = tqdm(loader, desc="Training", leave=False)
         for data, target in progress:
-            non_blocking = self.device.type == "cuda"
-            data = data.to(self.device, non_blocking=non_blocking)
-            target = target.to(self.device, non_blocking=non_blocking)
+            data = data.to(self.device)
+            target = target.to(self.device)
 
             self.optimizer.zero_grad()
             output = self.model(data)
@@ -96,9 +93,8 @@ class AudioClassificationTrainer:
         with torch.no_grad():
             progress = tqdm(loader, desc="Validation", leave=False)
             for data, target in progress:
-                non_blocking = self.device.type == "cuda"
-                data = data.to(self.device, non_blocking=non_blocking)
-                target = target.to(self.device, non_blocking=non_blocking)
+                data = data.to(self.device)
+                target = target.to(self.device)
                 output = self.model(data)
                 loss = self.criterion(output, target)
 
@@ -214,9 +210,8 @@ def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device):
 
     with torch.no_grad():
         for data, target in loader:
-            non_blocking = device.type == "cuda"
-            data = data.to(device, non_blocking=non_blocking)
-            target = target.to(device, non_blocking=non_blocking)
+            data = data.to(device)
+            target = target.to(device)
             output = model(data)
             probabilities = torch.softmax(output, dim=1)
 
@@ -251,26 +246,11 @@ def predict_test_set(
     preprocessor,
     device: torch.device,
     batch_size: int,
-    cache_dir: str | None = None,
 ) -> pd.DataFrame:
     from audio_transformer_model import AudioDataset  # local import to avoid cycles
 
-    dataset = AudioDataset(
-        test_csv,
-        test_audio_dir,
-        preprocessor,
-        cache_dir=cache_dir,
-    )
-    cpu_count = os.cpu_count() or 1
-    num_workers = min(4, max(1, cpu_count // 2))
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=False,
-    )
+    dataset = AudioDataset(test_csv, test_audio_dir, preprocessor)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
     model.eval()
     predictions: List[int] = []
@@ -278,7 +258,7 @@ def predict_test_set(
 
     with torch.no_grad():
         for data, names in loader:
-            data = data.to(device, non_blocking=device.type == "cuda")
+            data = data.to(device)
             output = model(data)
             preds = output.argmax(dim=1)
 
