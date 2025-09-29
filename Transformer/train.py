@@ -3,6 +3,8 @@ Transformer-based training pipeline for audio deepfake detection.
 """
 
 import os
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
@@ -21,7 +23,8 @@ from trainer import (
     plot_confusion_matrix,
     predict_test_set,
 )
-from audio_transformer_model import AudioTransformerClassifier,AudioPreprocessor, AudioDataset
+from audio_transformer_model import AudioTransformerClassifier, AudioPreprocessor, AudioDataset
+from cache_mel_features import cache_mel_features
 
 
 def main() -> None:
@@ -31,7 +34,7 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = False
 
     train_csv = "dataset/train.csv"
     test_csv = "dataset/test.csv"
@@ -44,7 +47,26 @@ def main() -> None:
         n_fft=2048,
         hop_length=512,
         max_len=5,
-        device=device,
+    )
+
+    cache_root = Path("cache") / "mels"
+    train_cache_dir = cache_root / "train"
+    test_cache_dir = cache_root / "test"
+
+    print("预缓存训练音频的 Mel 频谱...")
+    cache_mel_features(
+        csv_path=Path(train_csv),
+        audio_dir=Path(train_audio_dir),
+        cache_dir=train_cache_dir,
+        preprocessor=preprocessor,
+    )
+
+    print("预缓存测试音频的 Mel 频谱...")
+    cache_mel_features(
+        csv_path=Path(test_csv),
+        audio_dir=Path(test_audio_dir),
+        cache_dir=test_cache_dir,
+        preprocessor=preprocessor,
     )
 
     full_df = pd.read_csv(train_csv)
@@ -63,29 +85,39 @@ def main() -> None:
     train_df.to_csv("temp_train.csv", index=False)
     val_df.to_csv("temp_val.csv", index=False)
 
-    train_dataset = AudioDataset("temp_train.csv", train_audio_dir, preprocessor)
-    val_dataset = AudioDataset("temp_val.csv", train_audio_dir, preprocessor)
+    train_dataset = AudioDataset(
+        "temp_train.csv",
+        train_audio_dir,
+        preprocessor,
+        cache_dir=train_cache_dir,
+    )
+    val_dataset = AudioDataset(
+        "temp_val.csv",
+        train_audio_dir,
+        preprocessor,
+        cache_dir=train_cache_dir,
+    )
 
     batch_size = 64
-    num_workers = 8
+    cpu_count = os.cpu_count() or 1
+    num_workers = min(4, max(1, cpu_count // 2))
+    pin_memory = device.type == "cuda"
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=False,
+        pin_memory=pin_memory,
         persistent_workers=False,
-        prefetch_factor=3,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         persistent_workers=False,
-        prefetch_factor=2,
     )
 
     model = AudioTransformerClassifier(
@@ -146,6 +178,7 @@ def main() -> None:
         preprocessor=preprocessor,
         device=device,
         batch_size=batch_size,
+        cache_dir=str(test_cache_dir),
     )
 
     submission.to_csv("transformer_submission.csv", index=False)
