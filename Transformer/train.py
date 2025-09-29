@@ -3,6 +3,8 @@ Transformer-based training pipeline for audio deepfake detection.
 """
 
 import os
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
@@ -63,8 +65,22 @@ def main() -> None:
     train_df.to_csv("temp_train.csv", index=False)
     val_df.to_csv("temp_val.csv", index=False)
 
-    train_dataset = AudioDataset("temp_train.csv", train_audio_dir, preprocessor)
-    val_dataset = AudioDataset("temp_val.csv", train_audio_dir, preprocessor)
+    cache_root = Path("cache") / "mels"
+    train_cache_dir = cache_root / "train"
+    test_cache_dir = cache_root / "test"
+
+    train_dataset = AudioDataset(
+        "temp_train.csv",
+        train_audio_dir,
+        preprocessor,
+        cache_dir=train_cache_dir,
+    )
+    val_dataset = AudioDataset(
+        "temp_val.csv",
+        train_audio_dir,
+        preprocessor,
+        cache_dir=train_cache_dir,
+    )
 
     batch_size = 64
     num_workers = 8
@@ -146,6 +162,7 @@ def main() -> None:
         preprocessor=preprocessor,
         device=device,
         batch_size=batch_size,
+        cache_dir=test_cache_dir,
     )
 
     submission.to_csv("transformer_submission.csv", index=False)

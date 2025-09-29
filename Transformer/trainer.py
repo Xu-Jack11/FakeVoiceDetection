@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import List, Tuple
 
+import matplotlib.pyplot as plt
+import seaborn as sns
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-import seaborn as sns
 from sklearn.metrics import (
     accuracy_score,
     precision_recall_fscore_support,
@@ -246,11 +247,25 @@ def predict_test_set(
     preprocessor,
     device: torch.device,
     batch_size: int,
+    cache_dir: str | os.PathLike | None = None,
+    num_workers: int = 4,
 ) -> pd.DataFrame:
     from audio_transformer_model import AudioDataset  # local import to avoid cycles
 
-    dataset = AudioDataset(test_csv, test_audio_dir, preprocessor)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    dataset = AudioDataset(
+        test_csv,
+        test_audio_dir,
+        preprocessor,
+        cache_dir=cache_dir,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=False,
+    )
 
     model.eval()
     predictions: List[int] = []

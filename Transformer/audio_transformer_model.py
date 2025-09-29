@@ -2,15 +2,20 @@
 Transformer-based audio classification models.
 """
 
+import json
 import math
-import torch
-import torch.nn as nn
 import os
+import warnings
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Optional
-import torch.nn.functional as F
-import torchaudio
+
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchaudio
 from torch.utils.data import Dataset
 
 class PositionalEncoding(nn.Module):
@@ -33,6 +38,64 @@ class PositionalEncoding(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.pe[:, : x.size(1), :].to(x.dtype)
         return self.dropout(x)
+
+
+CACHE_META_FILENAME = "metadata.json"
+CACHE_EXT = ".pt"
+
+
+@dataclass(frozen=True)
+class MelCacheConfig:
+    sample_rate: int
+    n_mels: int
+    n_fft: int
+    hop_length: int
+    max_len: int
+
+    @classmethod
+    def from_preprocessor(cls, preprocessor: "AudioPreprocessor") -> "MelCacheConfig":
+        return cls(
+            sample_rate=preprocessor.sample_rate,
+            n_mels=preprocessor.n_mels,
+            n_fft=preprocessor.n_fft,
+            hop_length=preprocessor.hop_length,
+            max_len=preprocessor.max_len,
+        )
+
+    @classmethod
+    def load(cls, path: Path) -> "MelCacheConfig":
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return cls(**data)
+
+    def dump(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(asdict(self), handle, indent=2, sort_keys=True)
+
+
+def _validate_or_write_metadata(cache_dir: Path, config: MelCacheConfig, strict: bool) -> None:
+    meta_path = cache_dir / CACHE_META_FILENAME
+    if meta_path.exists():
+        try:
+            existing = MelCacheConfig.load(meta_path)
+        except Exception as exc:  # pragma: no cover - metadata read failure
+            message = f"Failed to read cache metadata ({meta_path}): {exc}."
+            if strict:
+                raise RuntimeError(message) from exc
+            warnings.warn(message, RuntimeWarning)
+            return
+
+        if existing != config:
+            message = (
+                "Cache configuration mismatch detected. "
+                "Please rebuild caches or remove the existing cache directory."
+            )
+            if strict:
+                raise ValueError(message)
+            warnings.warn(message, RuntimeWarning)
+    else:
+        config.dump(meta_path)
 
 
 class AudioTransformerClassifier(nn.Module):
@@ -213,29 +276,71 @@ class AudioPreprocessor:
 
 
 class AudioDataset(Dataset):
-    """Dataset that loads mel-spectrograms from audio files."""
+    """Dataset that loads mel-spectrograms from audio files with optional caching."""
 
     def __init__(
         self,
         csv_file: str,
         audio_dir: str,
         preprocessor: AudioPreprocessor,
+        cache_dir: Optional[str | os.PathLike] = None,
+        auto_save_cache: bool = True,
+        strict_cache: bool = True,
     ) -> None:
         self.data = pd.read_csv(csv_file)
         self.audio_dir = audio_dir
         self.preprocessor = preprocessor
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.auto_save_cache = auto_save_cache
+        self.strict_cache = strict_cache
+        self.cache_config: Optional[MelCacheConfig] = None
+
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self.cache_config = MelCacheConfig.from_preprocessor(self.preprocessor)
+            _validate_or_write_metadata(self.cache_dir, self.cache_config, strict=self.strict_cache)
 
     def __len__(self) -> int:
         return len(self.data)
 
+    def _load_from_cache(self, cache_path: Path) -> Optional[torch.Tensor]:
+        try:
+            return torch.load(cache_path, map_location="cpu")
+        except Exception as exc:  # pragma: no cover - logging only
+            warnings.warn(f"Failed to load cache file {cache_path}: {exc}", RuntimeWarning)
+            return None
+
+    def _write_to_cache(self, cache_path: Path, mel_spec: torch.Tensor) -> None:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(mel_spec, cache_path)
+        except Exception as exc:  # pragma: no cover - logging only
+            warnings.warn(f"Failed to write cache file {cache_path}: {exc}", RuntimeWarning)
+
     def __getitem__(self, idx: int):
         audio_name = self.data.iloc[idx]["audio_name"]
         audio_path = os.path.join(self.audio_dir, audio_name)
-        mel_spec = self.preprocessor.process_audio(audio_path)
+
+        mel_spec: Optional[torch.Tensor] = None
+        cache_path: Optional[Path] = None
+
+        if self.cache_dir is not None:
+            cache_path = self.cache_dir / f"{audio_name}{CACHE_EXT}"
+            if cache_path.exists():
+                mel_spec = self._load_from_cache(cache_path)
+
+        if mel_spec is None:
+            mel_spec = self.preprocessor.process_audio(audio_path)
+            if mel_spec is not None and cache_path is not None and self.auto_save_cache:
+                self._write_to_cache(cache_path, mel_spec)
+
         if mel_spec is None:
             mel_spec = torch.zeros(
-                1, self.preprocessor.n_mels, self.preprocessor.target_length
+                1,
+                self.preprocessor.n_mels,
+                self.preprocessor.target_length,
             )
+
         if "target" in self.data.columns:
             label = int(self.data.iloc[idx]["target"])
             return mel_spec, torch.tensor(label, dtype=torch.long)

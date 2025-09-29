@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import pandas as pd
 
-from audio_transformer_model import AudioTransformerClassifier,AudioPreprocessor, AudioDataset
+from audio_transformer_model import AudioTransformerClassifier, AudioPreprocessor, AudioDataset
 
 
 def load_checkpoint(model: torch.nn.Module, checkpoint_path: str, device: torch.device) -> None:
@@ -59,6 +59,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dim-feedforward", type=int, default=768)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--pooling", choices=["mean", "cls"], default="mean")
+    parser.add_argument(
+        "--cache-dir",
+        default="cache/mels/test",
+        help="Directory for cached mel features (read + write).",
+    )
+    parser.add_argument(
+        "--no-cache-save",
+        action="store_true",
+        help="Do not write new cache files during prediction.",
+    )
+    parser.add_argument(
+        "--relaxed-cache",
+        action="store_true",
+        help="Allow cache metadata mismatches without raising errors.",
+    )
     return parser.parse_args()
 
 
@@ -83,7 +98,14 @@ def main() -> None:
         device=device,
     )
 
-    dataset = AudioDataset(args.test_csv, args.audio_dir, preprocessor)
+    dataset = AudioDataset(
+        args.test_csv,
+        args.audio_dir,
+        preprocessor,
+        cache_dir=args.cache_dir,
+        auto_save_cache=not args.no_cache_save,
+        strict_cache=not args.relaxed_cache,
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
