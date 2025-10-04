@@ -82,8 +82,8 @@ def main() -> None:
         cache_dir=train_cache_dir,
     )
 
-    batch_size = 64
-    num_workers = 8
+    batch_size = 32
+    num_workers = 12
 
     train_loader = DataLoader(
         train_dataset,
@@ -109,7 +109,7 @@ def main() -> None:
         num_classes=2,
         d_model=256,
         nhead=8,
-        num_layers=4,
+        num_layers=8,
         dim_feedforward=768,
         dropout=0.1,
         pooling="mean",
@@ -120,14 +120,14 @@ def main() -> None:
     trainer = AudioClassificationTrainer(
         model=model,
         device=device,
-        learning_rate=0.01,
+        learning_rate=0.002,
         weight_decay=1e-4,
     )
 
     best_val_acc, best_val_loss = trainer.train(
         train_loader=train_loader,
         val_loader=val_loader,
-        epochs=3,
+        epochs=10,
         save_path="best_audio_transformer.pth",
     )
 
