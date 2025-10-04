@@ -1,0 +1,370 @@
+"""AASIST 模型在本地数据集上的训练脚本。"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.cuda.amp as amp
+import torch.nn as nn
+from sklearn.metrics import accuracy_score, classification_report, f1_score
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+
+from .config import DEFAULT_MODEL_CONFIG
+from .dataset import FakeVoiceWaveDataset, WaveDatasetConfig
+from .models import Model
+from .predict import run_inference
+
+
+def build_model(device: torch.device, config: Dict[str, object]) -> Model:
+    model = Model(config).to(device)
+    nb_params = sum(p.numel() for p in model.parameters())
+    print(f"模型参数量: {nb_params:,}")
+    return model
+
+
+def create_dataloaders(
+    data_root: Path,
+    batch_size: int,
+    num_workers: int,
+    sample_rate: int,
+    max_len: int,
+    val_split: float,
+    seed: int,
+) -> Tuple[DataLoader, DataLoader]:
+    import pandas as pd
+    from sklearn.model_selection import train_test_split
+
+    csv_path = data_root / "train.csv"
+    train_audio_dir = data_root / "train"
+
+    df = pd.read_csv(csv_path)
+    train_df, val_df = train_test_split(
+        df,
+        test_size=val_split,
+        random_state=seed,
+        stratify=df["target"],
+    )
+
+    tmp_dir = data_root.parent
+    train_split_csv = tmp_dir / "aasist_temp_train.csv"
+    val_split_csv = tmp_dir / "aasist_temp_val.csv"
+    train_df.to_csv(train_split_csv, index=False)
+    val_df.to_csv(val_split_csv, index=False)
+
+    train_dataset = FakeVoiceWaveDataset(
+        WaveDatasetConfig(
+            csv_path=train_split_csv,
+            audio_dir=train_audio_dir,
+            sample_rate=sample_rate,
+            max_len=max_len,
+            training=True,
+        )
+    )
+    val_dataset = FakeVoiceWaveDataset(
+        WaveDatasetConfig(
+            csv_path=val_split_csv,
+            audio_dir=train_audio_dir,
+            sample_rate=sample_rate,
+            max_len=max_len,
+            training=False,
+        )
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader
+
+
+def train_one_epoch(
+    model: Model,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: amp.GradScaler,
+    device: torch.device,
+    use_amp: bool,
+    freq_aug: bool,
+    epoch: int,
+    total_epochs: int,
+) -> Tuple[float, float]:
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    seen = 0
+
+    progress = tqdm(loader, desc=f"Train [{epoch}/{total_epochs}]", leave=False)
+    for batch_wave, batch_target in progress:
+        batch_wave = batch_wave.to(device)
+        batch_target = batch_target.to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+        with amp.autocast(enabled=use_amp):
+            _, logits = model(batch_wave, Freq_aug=freq_aug)
+            loss = criterion(logits, batch_target)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += loss.item() * batch_wave.size(0)
+        preds = torch.argmax(logits, dim=1)
+        correct += (preds == batch_target).sum().item()
+        seen += batch_target.size(0)
+
+        avg_loss_so_far = total_loss / max(seen, 1)
+        acc_so_far = correct / max(seen, 1)
+        progress.set_postfix({"loss": f"{avg_loss_so_far:.4f}", "acc": f"{acc_so_far * 100:.2f}%"})
+
+    avg_loss = total_loss / len(loader.dataset)
+    acc = correct / len(loader.dataset)
+    return avg_loss, acc
+
+
+def evaluate(
+    model: Model,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    use_amp: bool,
+    epoch: int,
+    total_epochs: int,
+) -> Tuple[float, float, float, str]:
+    model.eval()
+    total_loss = 0.0
+    all_preds: list[int] = []
+    all_targets: list[int] = []
+    correct = 0
+    seen = 0
+
+    with torch.no_grad():
+        progress = tqdm(loader, desc=f"Validate [{epoch}/{total_epochs}]", leave=False)
+        for batch_wave, batch_target in progress:
+            batch_wave = batch_wave.to(device)
+            batch_target = batch_target.to(device)
+            with amp.autocast(enabled=use_amp):
+                _, logits = model(batch_wave, Freq_aug=False)
+                loss = criterion(logits, batch_target)
+            total_loss += loss.item() * batch_wave.size(0)
+            preds = torch.argmax(logits, dim=1)
+            all_preds.extend(preds.detach().cpu().numpy())
+            all_targets.extend(batch_target.detach().cpu().numpy())
+            correct += (preds == batch_target).sum().item()
+            seen += batch_target.size(0)
+
+            avg_loss_so_far = total_loss / max(seen, 1)
+            acc_so_far = correct / max(seen, 1)
+            progress.set_postfix({"loss": f"{avg_loss_so_far:.4f}", "acc": f"{acc_so_far * 100:.2f}%"})
+
+    avg_loss = total_loss / len(loader.dataset)
+    acc = accuracy_score(all_targets, all_preds)
+    f1 = f1_score(all_targets, all_preds, average="weighted")
+    report = classification_report(
+        all_targets,
+        all_preds,
+        target_names=["AI Generated", "Real Human"],
+        digits=4,
+    )
+    return avg_loss, acc, f1, report
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train AASIST on local dataset")
+    parser.add_argument("--data-root", type=Path, default=Path("dataset"))
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--val-split", type=float, default=0.1)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--freq-aug", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output", type=Path, default=Path("Aasist/best_model.pth"))
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="运行设备 (例如 cuda 或 cpu)，默认自动检测",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="可选的 JSON 配置文件，用于覆盖默认的模型超参数",
+    )
+    parser.add_argument(
+        "--test-csv",
+        type=Path,
+        default=None,
+        help="可选测试集 CSV 路径（默认使用 data-root/test.csv）",
+    )
+    parser.add_argument(
+        "--test-audio-dir",
+        type=Path,
+        default=None,
+        help="可选测试集音频目录（默认使用 data-root/test）",
+    )
+    parser.add_argument(
+        "--predict-output",
+        type=Path,
+        default=Path("Aasist/predictions_after_train.csv"),
+        help="自动预测结果输出路径",
+    )
+    parser.add_argument(
+        "--predict-batch-size",
+        type=int,
+        default=64,
+        help="自动预测时的数据批大小",
+    )
+    parser.add_argument(
+        "--no-auto-predict",
+        action="store_true",
+        help="训练结束后跳过自动预测",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    if args.device is not None:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"使用设备: {device}")
+
+    model_config = dict(DEFAULT_MODEL_CONFIG)
+    if args.config is not None:
+        with args.config.open("r", encoding="utf-8") as f:
+            user_conf = json.load(f)
+        model_config.update(user_conf)
+
+    model = build_model(device, model_config)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
+    criterion = nn.CrossEntropyLoss()
+
+    use_amp = device.type == "cuda"
+    scaler = amp.GradScaler(enabled=use_amp)
+
+    data_root = args.data_root
+    test_csv_path = args.test_csv or (data_root / "test.csv")
+    test_audio_dir = args.test_audio_dir or (data_root / "test")
+    train_loader, val_loader = create_dataloaders(
+        data_root=data_root,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        sample_rate=model_config.get("sample_rate", 16000),
+        max_len=model_config.get("nb_samp", 64600),
+        val_split=args.val_split,
+        seed=args.seed,
+    )
+
+    best_f1 = 0.0
+    best_state = None
+
+    for epoch in range(args.epochs):
+        train_loss, train_acc = train_one_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            scaler,
+            device,
+            use_amp,
+            freq_aug=args.freq_aug,
+            epoch=epoch + 1,
+            total_epochs=args.epochs,
+        )
+        val_loss, val_acc, val_f1, report = evaluate(
+            model,
+            val_loader,
+            criterion,
+            device,
+            use_amp,
+            epoch=epoch + 1,
+            total_epochs=args.epochs,
+        )
+
+        print(f"Epoch {epoch + 1}/{args.epochs}")
+        print(
+            f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc * 100:.2f}%"
+        )
+        print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc * 100:.2f}% | Val F1: {val_f1:.4f}")
+        print(report)
+
+        if val_f1 > best_f1:
+            best_f1 = val_f1
+            best_state = {
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "config": model_config,
+                "metrics": {
+                    "train_loss": train_loss,
+                    "train_acc": train_acc,
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                    "val_f1": val_f1,
+                },
+            }
+            print(f"  -> 新的最佳模型 (F1={val_f1:.4f})")
+
+    if best_state is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(best_state, args.output)
+        print(f"最佳模型已保存到 {args.output}")
+
+        if args.no_auto_predict:
+            print("已根据 --no-auto-predict 参数跳过自动预测。")
+        else:
+            if test_csv_path.exists() and test_audio_dir.exists():
+                try:
+                    print("开始使用最佳模型进行自动预测…")
+                    run_inference(
+                        checkpoint=args.output,
+                        test_csv=test_csv_path,
+                        audio_dir=test_audio_dir,
+                        output=args.predict_output,
+                        batch_size=args.predict_batch_size,
+                        num_workers=args.num_workers,
+                        device=device,
+                        config_path=args.config,
+                        verbose=False,
+                    )
+                    print(f"自动预测完成，结果保存至 {args.predict_output}")
+                except Exception as exc:
+                    print(f"自动预测失败: {exc}")
+            else:
+                print("测试集 CSV 或音频目录不存在，自动预测已跳过。")
+    else:
+        print("未找到可保存的模型")
+
+
+if __name__ == "__main__":
+    main()
