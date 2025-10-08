@@ -1,0 +1,27 @@
+# AASIST3 依赖包
+
+# 核心依赖
+torch>=2.0.0
+torchaudio>=2.0.0
+numpy>=1.21.0
+pandas>=1.3.0
+scikit-learn>=1.0.0
+scipy>=1.7.0
+
+# 音频处理
+soundfile>=0.11.0
+librosa>=0.9.0
+
+# 训练工具
+tqdm>=4.62.0
+
+# 可选依赖 (SSL 特征)
+# transformers>=4.30.0  # wav2vec2/WavLM/Whisper
+
+# 可选依赖 (WebRTC VAD)
+# webrtcvad>=2.0.10
+
+# 开发依赖
+# pytest>=7.0.0
+# black>=22.0.0
+# flake8>=4.0.0
