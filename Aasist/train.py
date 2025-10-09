@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -26,6 +26,48 @@ from .dataset import FakeVoiceWaveDataset, WaveDatasetConfig
 from .models import Model
 from .predict import run_inference
 from .losses import build_loss
+
+
+class MaxLenWaveformCollate:
+    """Pad variable-length waveforms so DataLoader workers can stack batches."""
+
+    def __init__(self, max_len: int) -> None:
+        self.max_len = int(max_len)
+
+    def __call__(self, batch: List[Dict[str, object]]) -> Dict[str, object]:
+        if not batch:
+            raise ValueError("Empty batch received by the DataLoader.")
+
+        batch_waveforms: List[Tensor] = []
+        lengths: List[int] = []
+
+        for sample in batch:
+            waveform = sample["waveform"]
+            if not isinstance(waveform, Tensor):
+                raise TypeError("Expected waveform tensors in the batch.")
+
+            copy_len = min(int(waveform.shape[-1]), self.max_len)
+            padded = waveform.new_zeros(self.max_len)
+            padded[:copy_len] = waveform[..., :copy_len]
+
+            batch_waveforms.append(padded)
+            lengths.append(copy_len)
+
+        batch_dict: Dict[str, object] = {
+            "waveform": torch.stack(batch_waveforms, dim=0),
+            "length": torch.tensor(lengths, dtype=torch.long),
+        }
+
+        if all(sample.get("target") is not None for sample in batch):
+            batch_dict["target"] = torch.stack(
+                [sample["target"] for sample in batch],
+                dim=0,
+            )
+
+        if all(sample.get("utt_id") is not None for sample in batch):
+            batch_dict["utt_id"] = [str(sample["utt_id"]) for sample in batch]
+
+        return batch_dict
 
 
 def compute_best_threshold(probs: np.ndarray, targets: np.ndarray) -> float:
@@ -104,12 +146,15 @@ def create_dataloaders(
         )
     )
 
+    collate_fn = MaxLenWaveformCollate(max_len)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=collate_fn,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -117,6 +162,7 @@ def create_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=collate_fn,
     )
 
     return train_loader, val_loader

@@ -56,7 +56,7 @@ class PhaseFrontend(FeatureExtractor):
         group_delay = -diff_freq
 
         # Modified group delay using magnitude to suppress spikes
-        mgd = group_delay * magnitude[:, 1:, :]
+        mgd = group_delay[:, 1:, :] * magnitude[:, 1:, :]
         mgd = torch.nn.functional.pad(mgd, (0, 0, 1, 0))
 
         features = torch.stack([rps, group_delay, mgd], dim=1)

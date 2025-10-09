@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -127,6 +127,25 @@ class Model(nn.Module):
         features = self.ssl(dummy, sample_rate=self.sample_rate, training=False)
         return features.size(-1)
 
+    @staticmethod
+    def _align_time_dim(feats: List[Tensor]) -> List[Tensor]:
+        if not feats:
+            return feats
+        max_time = max(tensor.shape[-1] for tensor in feats)
+        aligned: List[Tensor] = []
+        for tensor in feats:
+            current_time = tensor.shape[-1]
+            if current_time == max_time:
+                aligned.append(tensor)
+                continue
+            slice_len = min(current_time, max_time)
+            new_shape = list(tensor.shape)
+            new_shape[-1] = max_time
+            padded = tensor.new_zeros(new_shape)
+            padded[..., :slice_len] = tensor[..., :slice_len]
+            aligned.append(padded)
+        return aligned
+
     def _extract_batch(
         self,
         extractor: nn.Module,
@@ -162,6 +181,7 @@ class Model(nn.Module):
         lfcc = self._extract_batch(self.lfcc, waveform, "lfcc", utt_ids, training)
         cqcc = self._extract_batch(self.cqcc, waveform, "cqcc", utt_ids, training)
         amp_feats = [lfcc.unsqueeze(1), cqcc.unsqueeze(1)]
+        amp_feats = self._align_time_dim(amp_feats)
         amp_input = torch.cat(amp_feats, dim=1)
         amp_repr = self.amplitude_encoder(amp_input)
         amp_logits = self.amplitude_head(amp_repr)

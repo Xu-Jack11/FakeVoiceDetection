@@ -101,7 +101,7 @@ class CQCCFrontend(FeatureExtractor):
             filters.append(response)
         filterbank = torch.stack(filters)
         filterbank = filterbank / torch.clamp(filterbank.sum(dim=1, keepdim=True), min=1e-6)
-        proj = torch.matmul(filterbank, magnitude.transpose(1, 2)).transpose(1, 2)
+        proj = torch.matmul(magnitude.transpose(1, 2), filterbank.t())
         return proj.clamp_min(1e-6)
 
     def _extract(

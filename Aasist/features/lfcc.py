@@ -94,7 +94,7 @@ class LFCCFrontend(FeatureExtractor):
         )
         power = stft.abs().pow(2)
         fbanks = self._get_filterbank(sample_rate).to(waveform.device)
-        spec = torch.matmul(fbanks, power.transpose(1, 2)).transpose(1, 2)
+        spec = torch.matmul(power.transpose(1, 2), fbanks.t())
         spec = torch.log(spec + 1e-6)
         lfcc = torch.matmul(spec, self.dct_matrix.t().to(spec.device))
         lfcc = lfcc.transpose(1, 2)
