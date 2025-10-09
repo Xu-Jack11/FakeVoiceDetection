@@ -10,7 +10,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import torch
 from torch import Tensor
-import torch.cuda.amp as amp
+import torch.amp as amp
 import torch.nn as nn
 from sklearn.metrics import (
     accuracy_score,
@@ -152,7 +152,7 @@ def train_one_epoch(
             utt_ids = [str(utt_field)]
 
         optimizer.zero_grad(set_to_none=True)
-        with amp.autocast(enabled=use_amp):
+        with amp.autocast('cuda',enabled=use_amp):
             branch_logits, logits = model(batch_wave, utt_ids=utt_ids, training=True)
             fused_loss = criterion(logits, batch_target)
             if branch_loss_weight > 0:
@@ -210,7 +210,7 @@ def evaluate(
                 utt_ids = []
             else:
                 utt_ids = [str(utt_field)]
-            with amp.autocast(enabled=use_amp):
+            with amp.autocast('cuda',enabled=use_amp):
                 _, logits = model(batch_wave, utt_ids=utt_ids, training=False)
                 scaled_logits = logits / max(temperature, 1e-6)
                 loss = criterion(scaled_logits, batch_target)
