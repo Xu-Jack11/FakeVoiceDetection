@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from torch import Tensor
 
 from .config import DEFAULT_MODEL_CONFIG
 from .dataset import FakeVoiceWaveDataset, WaveDatasetConfig
@@ -92,69 +93,92 @@ def _build_model(
     return model, model_config, state
 
 
-def _create_dataloader(
+def _create_dataset(
     csv_path: Path,
     audio_dir: Path,
     model_config: Dict[str, object],
-    batch_size: int,
-    num_workers: int,
-    device: torch.device,
-) -> DataLoader:
-    dataset = FakeVoiceWaveDataset(
+) -> FakeVoiceWaveDataset:
+    return FakeVoiceWaveDataset(
         WaveDatasetConfig(
             csv_path=csv_path,
             audio_dir=audio_dir,
             sample_rate=int(model_config.get("sample_rate", 16000)),
             max_len=int(model_config.get("nb_samp", 64600)),
             training=False,
+            eval_chunk_seconds=-1.0,
+            telephony_aug=False,
         )
     )
 
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=device.type == "cuda",
-    )
+
+def _chunk_waveform(
+    waveform: Tensor,
+    sample_rate: int,
+    chunk_seconds: float,
+    hop_ratio: float,
+) -> List[Tensor]:
+    chunk_len = max(int(chunk_seconds * sample_rate), sample_rate)
+    hop = max(int(chunk_len * hop_ratio), 1)
+    if waveform.numel() < chunk_len:
+        waveform = F.pad(waveform, (0, chunk_len - waveform.numel()))
+    total_len = waveform.numel()
+    starts = list(range(0, total_len - chunk_len + 1, hop))
+    if not starts or starts[-1] + chunk_len < total_len:
+        starts.append(max(total_len - chunk_len, 0))
+    return [waveform[start : start + chunk_len] for start in starts]
 
 
 def _collect_predictions(
     model: Model,
-    loader: DataLoader,
+    dataset: FakeVoiceWaveDataset,
     device: torch.device,
+    model_config: Dict[str, object],
+    batch_size: int,
+    temperature: float,
+    threshold: float,
 ) -> pd.DataFrame:
     rows: List[dict] = []
-    softmax = torch.nn.Softmax(dim=1)
+    sample_rate = int(model_config.get("sample_rate", 16000))
+    chunk_seconds = float(model_config.get("inference_chunk_seconds", 4.0))
+    chunk_seconds = min(max(chunk_seconds, 3.0), 5.0)
+    hop_ratio = float(model_config.get("inference_hop_ratio", 0.5))
+    topk_ratio = float(model_config.get("inference_topk_ratio", 0.5))
 
     with torch.no_grad():
-        for batch_wave, batch_names in loader:
-            batch_wave = batch_wave.to(device)
-            _, logits = model(batch_wave, Freq_aug=False)
-            probs = softmax(logits)
-            preds = torch.argmax(probs, dim=1)
+        for idx in range(len(dataset)):
+            sample = dataset[idx]
+            waveform = sample["waveform"].to(device)
+            utt_id = str(sample.get("utt_id", idx))
+            chunks = _chunk_waveform(waveform, sample_rate, chunk_seconds, hop_ratio)
+            if not chunks:
+                continue
 
-            batch_names_list: Iterable[str]
-            if isinstance(batch_names, torch.Tensor):
-                batch_names_list = batch_names.cpu().tolist()
-            else:
-                batch_names_list = list(batch_names)
+            chunk_logits: List[Tensor] = []
+            for start in range(0, len(chunks), batch_size):
+                batch_chunks = torch.stack(chunks[start : start + batch_size]).to(device)
+                chunk_ids = [f"{utt_id}_chunk{start + i}" for i in range(batch_chunks.size(0))]
+                _, logits = model(batch_chunks, utt_ids=chunk_ids, training=False)
+                chunk_logits.append(logits / max(temperature, 1e-6))
 
-            for name, pred, prob_vector in zip(
-                batch_names_list,
-                preds.cpu().tolist(),
-                probs.cpu().tolist(),
-            ):
-                pred_int = int(pred)
-                rows.append(
-                    {
-                        "audio_name": str(name),
-                        "target": pred_int,
-                        "label": LABEL_MAP.get(pred_int, "未知"),
-                        "confidence": float(prob_vector[pred_int]),
-                    }
-                )
+            logits = torch.cat(chunk_logits, dim=0)
+            probs = torch.softmax(logits, dim=1)[:, 1]
+            mean_prob = probs.mean().item()
+            topk = max(1, int(len(probs) * topk_ratio))
+            topk_prob = probs.topk(topk).values.mean().item()
+            score = float((mean_prob + topk_prob) / 2.0)
+            pred_int = int(score >= threshold)
 
+            rows.append(
+                {
+                    "audio_name": utt_id,
+                    "target": pred_int,
+                    "label": LABEL_MAP.get(pred_int, "未知"),
+                    "confidence": score,
+                    "mean_conf": mean_prob,
+                    "topk_conf": topk_prob,
+                    "num_chunks": len(chunks),
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -173,16 +197,33 @@ def run_inference(
 
     inference_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model, model_config, _ = _build_model(inference_device, checkpoint, config_path)
-    loader = _create_dataloader(
+    model, model_config, state = _build_model(inference_device, checkpoint, config_path)
+    dataset = _create_dataset(
         csv_path=test_csv,
         audio_dir=audio_dir,
         model_config=model_config,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        device=inference_device,
     )
-    df = _collect_predictions(model, loader, inference_device)
+
+    temperature = 1.0
+    threshold = float(model_config.get("inference_threshold", 0.5))
+    if isinstance(state, dict):
+        temperature = float(state.get("temperature", temperature))
+        threshold = float(state.get("threshold", threshold))
+
+    if verbose:
+        print(
+            f"推理使用温度缩放 {temperature:.2f}，阈值 {threshold:.3f}，chunk={model_config.get('inference_chunk_seconds', 4.0)}s"
+        )
+
+    df = _collect_predictions(
+        model,
+        dataset,
+        inference_device,
+        model_config,
+        batch_size=max(batch_size, 1),
+        temperature=temperature,
+        threshold=threshold,
+    )
 
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)
