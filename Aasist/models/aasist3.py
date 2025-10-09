@@ -198,11 +198,23 @@ class Model(nn.Module):
         utt_ids: Optional[list[str]],
         training: bool,
     ) -> Tensor:
+        # 训练阶段 or 无缓存需求时，直接整体并行提取，加快 GPU 利用率
+        use_vectorized = training or utt_ids is None
+
+        if use_vectorized:
+            return extractor(
+                waveform,
+                sample_rate=self.sample_rate,
+                cache_key=None,
+                training=training,
+                metadata={"branch": branch},
+            )
+
         outputs = []
         batch_size = waveform.size(0)
         for i in range(batch_size):
             key = None
-            if not training and utt_ids is not None:
+            if utt_ids is not None:
                 key = f"{utt_ids[i]}_{branch}"
             feat = extractor(
                 waveform[i : i + 1],
