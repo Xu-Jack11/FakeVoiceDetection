@@ -74,6 +74,7 @@ python -m Aasist.train \
 - `--config`: 传入 JSON 覆盖默认模型/推理配置。
 - `--loss`: `cross_entropy`、`focal`、`class_balanced`、`margin`（AAM-Softmax）等。
 - `--branch-loss-weight`: 分支辅助监督权重（默认 0.2，设为 0 关闭）。
+- `--feature-types`: 指定启用的分支/特征（如 `--feature-types lfcc phase`）。
 - `--predict-output` / `--predict-batch-size`: 控制训练后自动推理。
 - `--no-auto-predict`: 仅训练不推理。
 
@@ -116,7 +117,14 @@ python -m Aasist.predict \
   "inference_hop_ratio": 0.5,
   "fusion_hidden": [192, 96],
   "telephony_aug": false  // 关闭训练期电话增广
+  "enable_ssl": false     // 关闭 SSL 分支
 }
+```
+
+也可以在命令行使用 `--feature-types` 精确控制启用的分支：`lfcc`、`cqcc`、`phase`、`ssl`、`aasist`，默认全开。例如仅保留幅度+原始骨干：
+
+```bash
+python -m Aasist.train --feature-types lfcc cqcc aasist
 ```
 
 通过 `--config path/to/config.json` 在训练/推理脚本中引用。预测脚本会优先加载 checkpoint 内嵌配置，再应用外部覆盖。

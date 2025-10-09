@@ -81,42 +81,86 @@ class Model(nn.Module):
         cache_root = d_args.get("feature_cache_root", "Aasist/cache")
         cache_root = str(cache_root)
 
-        # 幅度支路：LFCC + CQCC
         cache_root_path = Path(cache_root)
-        self.lfcc = LFCCFrontend(
-            cache_dir=cache_root_path / "lfcc",
-        )
-        self.cqcc = CQCCFrontend(
-            cache_dir=cache_root_path / "cqcc",
-        )
-        self.amplitude_encoder = SpectralEncoder(in_channels=2)
-        self.amplitude_head = BranchClassifier(self.amplitude_encoder.out_dim)
+
+        self.enable_lfcc = bool(d_args.get("enable_lfcc", True))
+        self.enable_cqcc = bool(d_args.get("enable_cqcc", True))
+        self.enable_phase = bool(d_args.get("enable_phase", True))
+        self.enable_ssl = bool(d_args.get("enable_ssl", True))
+        self.enable_aasist = bool(d_args.get("enable_aasist", True))
+
+        # 幅度支路：LFCC + CQCC
+        self.amplitude_extractors: list[tuple[str, nn.Module]] = []
+        if self.enable_lfcc:
+            self.lfcc = LFCCFrontend(cache_dir=cache_root_path / "lfcc")
+            self.amplitude_extractors.append(("lfcc", self.lfcc))
+        else:
+            self.lfcc = None
+        if self.enable_cqcc:
+            self.cqcc = CQCCFrontend(cache_dir=cache_root_path / "cqcc")
+            self.amplitude_extractors.append(("cqcc", self.cqcc))
+        else:
+            self.cqcc = None
+
+        if self.amplitude_extractors:
+            self.amplitude_encoder = SpectralEncoder(in_channels=len(self.amplitude_extractors))
+            self.amplitude_head = BranchClassifier(self.amplitude_encoder.out_dim)
+        else:
+            self.amplitude_encoder = None
+            self.amplitude_head = None
 
         # 相位支路
-        self.phase = PhaseFrontend(cache_dir=cache_root_path / "phase")
-        self.phase_encoder = SpectralEncoder(in_channels=3)
-        self.phase_head = BranchClassifier(self.phase_encoder.out_dim)
+        if self.enable_phase:
+            self.phase = PhaseFrontend(cache_dir=cache_root_path / "phase")
+            self.phase_encoder = SpectralEncoder(in_channels=3)
+            self.phase_head = BranchClassifier(self.phase_encoder.out_dim)
+        else:
+            self.phase = None
+            self.phase_encoder = None
+            self.phase_head = None
 
         # SSL 支路
-        ssl_model_name = str(d_args.get("ssl_model", "wav2vec2_base"))
-        self.ssl = SSLFrontend(
-            model_name=ssl_model_name,
-            cache_dir=cache_root_path / "ssl",
-        )
-        ssl_out_dim = self._infer_ssl_dim()
-        self.ssl_encoder = SSLBranch(ssl_out_dim * 2)
-        self.ssl_head = BranchClassifier(self.ssl_encoder.out_dim)
+        if self.enable_ssl:
+            ssl_model_name = str(d_args.get("ssl_model", "wav2vec2_base"))
+            self.ssl = SSLFrontend(
+                model_name=ssl_model_name,
+                cache_dir=cache_root_path / "ssl",
+            )
+            ssl_out_dim = self._infer_ssl_dim()
+            self.ssl_encoder = SSLBranch(ssl_out_dim * 2)
+            self.ssl_head = BranchClassifier(self.ssl_encoder.out_dim)
+        else:
+            self.ssl = None
+            self.ssl_encoder = None
+            self.ssl_head = None
 
         # AASIST 原始骨干用于增强幅度支路表示
-        aasist_conf = dict(d_args)
-        aasist_conf.setdefault("architecture", "AASIST3")
-        self.aasist_backbone = AASISTBackbone(aasist_conf)
-        gat_dims = aasist_conf.get("gat_dims", [64, 32])
-        aasist_dim = 5 * gat_dims[-1] if isinstance(gat_dims, (list, tuple)) else 160
-        self.aasist_head = BranchClassifier(aasist_dim)
+        if self.enable_aasist:
+            aasist_conf = dict(d_args)
+            aasist_conf.setdefault("architecture", "AASIST3")
+            self.aasist_backbone = AASISTBackbone(aasist_conf)
+            gat_dims = aasist_conf.get("gat_dims", [64, 32])
+            aasist_dim = 5 * gat_dims[-1] if isinstance(gat_dims, (list, tuple)) else 160
+            self.aasist_head = BranchClassifier(aasist_dim)
+        else:
+            self.aasist_backbone = None
+            self.aasist_head = None
 
+        branch_names: list[str] = []
+        if self.amplitude_encoder is not None:
+            branch_names.append("amplitude")
+        if self.phase_head is not None:
+            branch_names.append("phase")
+        if self.ssl_head is not None:
+            branch_names.append("ssl")
+        if self.aasist_head is not None:
+            branch_names.append("aasist")
+        if not branch_names:
+            raise ValueError("必须至少启用一个 AASIST3 特征分支")
+
+        self.branch_names = branch_names
         self.fusion = LogitFusionHead(
-            ["amplitude", "phase", "ssl", "aasist"],
+            branch_names,
             logit_dim=2,
             hidden_dims=d_args.get("fusion_hidden", (128, 64)),
             dropout=float(d_args.get("fusion_dropout", 0.1)),
@@ -177,34 +221,31 @@ class Model(nn.Module):
         training: bool = True,
         **kwargs: object,
     ) -> tuple[Dict[str, Tensor], Tensor]:
-        # 幅度特征
-        lfcc = self._extract_batch(self.lfcc, waveform, "lfcc", utt_ids, training)
-        cqcc = self._extract_batch(self.cqcc, waveform, "cqcc", utt_ids, training)
-        amp_feats = [lfcc.unsqueeze(1), cqcc.unsqueeze(1)]
-        amp_feats = self._align_time_dim(amp_feats)
-        amp_input = torch.cat(amp_feats, dim=1)
-        amp_repr = self.amplitude_encoder(amp_input)
-        amp_logits = self.amplitude_head(amp_repr)
+        branch_logits: dict[str, Tensor] = {}
 
-        # 相位
-        phase = self._extract_batch(self.phase, waveform, "phase", utt_ids, training)
-        phase_repr = self.phase_encoder(phase)
-        phase_logits = self.phase_head(phase_repr)
+        if self.amplitude_encoder is not None:
+            amp_feats: list[Tensor] = []
+            for feat_name, extractor in self.amplitude_extractors:
+                feat = self._extract_batch(extractor, waveform, feat_name, utt_ids, training)
+                amp_feats.append(feat.unsqueeze(1))
+            amp_feats = self._align_time_dim(amp_feats)
+            amp_input = torch.cat(amp_feats, dim=1)
+            amp_repr = self.amplitude_encoder(amp_input)
+            branch_logits["amplitude"] = self.amplitude_head(amp_repr)
 
-        # SSL
-        ssl_feats = self._extract_batch(self.ssl, waveform, "ssl", utt_ids, training)
-        ssl_repr = self.ssl_encoder(ssl_feats)
-        ssl_logits = self.ssl_head(ssl_repr)
+        if self.phase is not None and self.phase_encoder is not None:
+            phase = self._extract_batch(self.phase, waveform, "phase", utt_ids, training)
+            phase_repr = self.phase_encoder(phase)
+            branch_logits["phase"] = self.phase_head(phase_repr)
 
-        # AASIST 原支路
-        aasist_repr, aasist_logits = self.aasist_backbone(waveform, Freq_aug=training)
-        aasist_logits = self.aasist_head(aasist_repr)
+        if self.ssl is not None and self.ssl_encoder is not None:
+            ssl_feats = self._extract_batch(self.ssl, waveform, "ssl", utt_ids, training)
+            ssl_repr = self.ssl_encoder(ssl_feats)
+            branch_logits["ssl"] = self.ssl_head(ssl_repr)
 
-        branch_logits = {
-            "amplitude": amp_logits,
-            "phase": phase_logits,
-            "ssl": ssl_logits,
-            "aasist": aasist_logits,
-        }
+        if self.aasist_backbone is not None and self.aasist_head is not None:
+            aasist_repr, _ = self.aasist_backbone(waveform, Freq_aug=training)
+            branch_logits["aasist"] = self.aasist_head(aasist_repr)
+
         fused_logits = self.fusion(branch_logits)
         return branch_logits, fused_logits

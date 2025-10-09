@@ -20,4 +20,9 @@ DEFAULT_MODEL_CONFIG: Dict[str, object] = {
     "inference_chunk_seconds": 4.0,
     "inference_hop_ratio": 0.5,
     "inference_topk_ratio": 0.5,
+    "enable_lfcc": True,
+    "enable_cqcc": True,
+    "enable_phase": True,
+    "enable_ssl": True,
+    "enable_aasist": True,
 }

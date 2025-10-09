@@ -330,6 +330,14 @@ def parse_args() -> argparse.Namespace:
         help="可选的 JSON 配置文件，用于覆盖默认的模型超参数",
     )
     parser.add_argument(
+        "--feature-types",
+        type=str,
+        nargs="*",
+        choices=["lfcc", "cqcc", "phase", "ssl", "aasist"],
+        default=None,
+        help="手动指定需要启用的特征分支（默认启用全部）",
+    )
+    parser.add_argument(
         "--test-csv",
         type=Path,
         default=None,
@@ -378,6 +386,13 @@ def main() -> None:
         with args.config.open("r", encoding="utf-8") as f:
             user_conf = json.load(f)
         model_config.update(user_conf)
+
+    if args.feature_types is not None:
+        enabled = {name.lower() for name in args.feature_types}
+        if not enabled:
+            raise ValueError("--feature-types 至少需要指定一个分支")
+        for name in ("lfcc", "cqcc", "phase", "ssl", "aasist"):
+            model_config[f"enable_{name}"] = name in enabled
 
     model = build_model(device, model_config)
 
