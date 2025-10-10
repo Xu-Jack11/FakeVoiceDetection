@@ -71,6 +71,17 @@ class MaxLenWaveformCollate:
 
 
 def compute_best_threshold(probs: np.ndarray, targets: np.ndarray) -> float:
+    probs = np.asarray(probs, dtype=np.float64)
+    targets = np.asarray(targets, dtype=np.int64)
+
+    valid_mask = np.isfinite(probs)
+    if not valid_mask.any():
+        return 0.5
+
+    if valid_mask.sum() != probs.size:
+        probs = probs[valid_mask]
+        targets = targets[valid_mask]
+
     precision, recall, thresholds = precision_recall_curve(targets, probs)
     if thresholds.size == 0:
         return 0.5
@@ -258,6 +269,7 @@ def evaluate(
                 utt_ids = [str(utt_field)]
             with amp.autocast('cuda',enabled=use_amp):
                 _, logits = model(batch_wave, utt_ids=utt_ids, training=False)
+                logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
                 scaled_logits = logits / max(temperature, 1e-6)
                 loss = criterion(scaled_logits, batch_target)
             total_loss += loss.item() * batch_wave.size(0)
@@ -280,8 +292,11 @@ def evaluate(
         all_preds,
         target_names=["AI Generated", "Real Human"],
         digits=4,
+        zero_division=0,
     )
-    logits_tensor = torch.cat(all_logits, dim=0) / max(temperature, 1e-6)
+    logits_tensor = torch.cat(all_logits, dim=0)
+    logits_tensor = torch.nan_to_num(logits_tensor, nan=0.0, posinf=30.0, neginf=-30.0)
+    logits_tensor = logits_tensor / max(temperature, 1e-6)
     probs = torch.softmax(logits_tensor, dim=1)[:, 1].numpy()
     return avg_loss, acc, f1, report, probs, np.asarray(all_targets)
 
