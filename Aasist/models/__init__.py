@@ -1,3 +1,3 @@
-from .AASIST import Model
+from .aasist3 import Model
 
 __all__ = ["Model"]

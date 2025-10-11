@@ -395,8 +395,8 @@ class ResidualBlock(nn.Module):
         return out
 
 
-class Model(nn.Module):
-    """AASIST 主模型。"""
+class AASISTBackbone(nn.Module):
+    """AASIST 基础骨干网络，负责原始幅度支路的编码。"""
 
     def __init__(self, d_args: dict) -> None:
         super().__init__()
@@ -526,3 +526,13 @@ class Model(nn.Module):
         output = self.out_layer(last_hidden)
 
         return last_hidden, output
+
+
+__all__ = [
+    "GraphAttentionLayer",
+    "HtrgGraphAttentionLayer",
+    "GraphPool",
+    "CONV",
+    "ResidualBlock",
+    "AASISTBackbone",
+]
