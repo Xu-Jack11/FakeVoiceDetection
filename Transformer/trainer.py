@@ -26,8 +26,10 @@ import pandas as pd
 class TrainingHistory:
     train_losses: List[float]
     train_accuracies: List[float]
+    train_f1_scores: List[float]
     val_losses: List[float]
     val_accuracies: List[float]
+    val_f1_scores: List[float]
 
 
 class AudioClassificationTrainer:
@@ -47,15 +49,17 @@ class AudioClassificationTrainer:
             self.model.parameters(), lr=learning_rate, weight_decay=weight_decay
         )
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode="min", factor=0.5, patience=5
+            self.optimizer, mode="max", factor=0.5, patience=5
         )
-        self.history = TrainingHistory([], [], [], [])
+        self.history = TrainingHistory([], [], [], [], [], [])
 
-    def train_epoch(self, loader: DataLoader) -> Tuple[float, float]:
+    def train_epoch(self, loader: DataLoader) -> Tuple[float, float, float]:
         self.model.train()
         total_loss = 0.0
         correct = 0
         total = 0
+        all_preds: List[int] = []
+        all_targets: List[int] = []
 
         progress = tqdm(loader, desc="Training", leave=False)
         for data, target in progress:
@@ -73,17 +77,25 @@ class AudioClassificationTrainer:
             correct += (preds == target).sum().item()
             total += target.size(0)
 
+            all_preds.extend(preds.cpu().tolist())
+            all_targets.extend(target.cpu().tolist())
+
             progress.set_postfix(loss=f"{loss.item():.4f}", acc=f"{100*correct/total:.2f}%")
 
         avg_loss = total_loss / len(loader)
         accuracy = 100 * correct / total
+        
+        # Calculate F1 score
+        _, _, f1, _ = precision_recall_fscore_support(
+            all_targets, all_preds, average="weighted", zero_division=0
+        )
 
         if self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        return avg_loss, accuracy
+        return avg_loss, accuracy, f1
 
-    def validate_epoch(self, loader: DataLoader) -> Tuple[float, float, List[int], List[int]]:
+    def validate_epoch(self, loader: DataLoader) -> Tuple[float, float, float, List[int], List[int]]:
         self.model.eval()
         total_loss = 0.0
         correct = 0
@@ -111,11 +123,16 @@ class AudioClassificationTrainer:
 
         avg_loss = total_loss / len(loader)
         accuracy = 100 * correct / total
+        
+        # Calculate F1 score
+        _, _, f1, _ = precision_recall_fscore_support(
+            all_targets, all_preds, average="weighted", zero_division=0
+        )
 
         if self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        return avg_loss, accuracy, all_preds, all_targets
+        return avg_loss, accuracy, f1, all_preds, all_targets
 
     def train(
         self,
@@ -124,6 +141,7 @@ class AudioClassificationTrainer:
         epochs: int,
         save_path: str,
     ) -> Tuple[float, float]:
+        best_val_f1 = 0.0
         best_val_acc = 0.0
         best_val_loss = float("inf")
         patience_counter = 0
@@ -136,21 +154,25 @@ class AudioClassificationTrainer:
             print(f"\nEpoch {epoch + 1}/{epochs}")
             print("-" * 50)
 
-            train_loss, train_acc = self.train_epoch(train_loader)
-            val_loss, val_acc, val_preds, val_targets = self.validate_epoch(val_loader)
+            train_loss, train_acc, train_f1 = self.train_epoch(train_loader)
+            val_loss, val_acc, val_f1, val_preds, val_targets = self.validate_epoch(val_loader)
 
             self.history.train_losses.append(train_loss)
             self.history.train_accuracies.append(train_acc)
+            self.history.train_f1_scores.append(train_f1)
             self.history.val_losses.append(val_loss)
             self.history.val_accuracies.append(val_acc)
+            self.history.val_f1_scores.append(val_f1)
 
-            self.scheduler.step(val_loss)
+            self.scheduler.step(val_f1)
 
-            print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-            print(f"Val   Loss: {val_loss:.4f}, Val   Acc: {val_acc:.2f}%")
+            print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, Train F1: {train_f1:.4f}")
+            print(f"Val   Loss: {val_loss:.4f}, Val   Acc: {val_acc:.2f}%, Val   F1: {val_f1:.4f}")
             print(f"Learning Rate: {self.optimizer.param_groups[0]['lr']:.6f}")
 
-            if val_acc > best_val_acc:
+            # Use F1 score as the main criterion for saving best model
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
                 best_val_acc = val_acc
                 best_val_loss = val_loss
                 patience_counter = 0
@@ -162,12 +184,13 @@ class AudioClassificationTrainer:
                         "train_loss": train_loss,
                         "val_loss": val_loss,
                         "val_acc": val_acc,
+                        "val_f1": val_f1,
                         "val_preds": val_preds,
                         "val_targets": val_targets,
                     },
                     save_path,
                 )
-                print("New best model saved.")
+                print(f"New best model saved (F1: {best_val_f1:.4f}).")
             else:
                 patience_counter += 1
 
@@ -176,28 +199,40 @@ class AudioClassificationTrainer:
                 break
 
         print("\nTraining complete.")
+        print(f"Best Val F1 Score: {best_val_f1:.4f}")
         print(f"Best Val Accuracy: {best_val_acc:.2f}%")
         print(f"Best Val Loss: {best_val_loss:.4f}")
-        return best_val_acc, best_val_loss
+        return best_val_f1, best_val_loss
 
     def plot_training_history(self, save_path: str) -> None:
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+        fig, axes = plt.subplots(1, 3, figsize=(20, 5))
 
-        ax1.plot(self.history.train_losses, label="Train Loss", color="blue")
-        ax1.plot(self.history.val_losses, label="Val Loss", color="red")
-        ax1.set_title("Training and Validation Loss")
-        ax1.set_xlabel("Epoch")
-        ax1.set_ylabel("Loss")
-        ax1.legend()
-        ax1.grid(True)
+        # Plot Loss
+        axes[0].plot(self.history.train_losses, label="Train Loss", color="blue")
+        axes[0].plot(self.history.val_losses, label="Val Loss", color="red")
+        axes[0].set_title("Training and Validation Loss")
+        axes[0].set_xlabel("Epoch")
+        axes[0].set_ylabel("Loss")
+        axes[0].legend()
+        axes[0].grid(True)
 
-        ax2.plot(self.history.train_accuracies, label="Train Acc", color="blue")
-        ax2.plot(self.history.val_accuracies, label="Val Acc", color="red")
-        ax2.set_title("Training and Validation Accuracy")
-        ax2.set_xlabel("Epoch")
-        ax2.set_ylabel("Accuracy (%)")
-        ax2.legend()
-        ax2.grid(True)
+        # Plot Accuracy
+        axes[1].plot(self.history.train_accuracies, label="Train Acc", color="blue")
+        axes[1].plot(self.history.val_accuracies, label="Val Acc", color="red")
+        axes[1].set_title("Training and Validation Accuracy")
+        axes[1].set_xlabel("Epoch")
+        axes[1].set_ylabel("Accuracy (%)")
+        axes[1].legend()
+        axes[1].grid(True)
+
+        # Plot F1 Score
+        axes[2].plot(self.history.train_f1_scores, label="Train F1", color="blue")
+        axes[2].plot(self.history.val_f1_scores, label="Val F1", color="red")
+        axes[2].set_title("Training and Validation F1 Score")
+        axes[2].set_xlabel("Epoch")
+        axes[2].set_ylabel("F1 Score")
+        axes[2].legend()
+        axes[2].grid(True)
 
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches="tight")

@@ -83,7 +83,7 @@ def main() -> None:
     )
 
     batch_size = 32
-    num_workers = 12
+    num_workers = 8
 
     train_loader = DataLoader(
         train_dataset,
@@ -109,7 +109,7 @@ def main() -> None:
         num_classes=2,
         d_model=256,
         nhead=8,
-        num_layers=8,
+        num_layers=12,
         dim_feedforward=768,
         dropout=0.1,
         pooling="mean",
@@ -124,10 +124,10 @@ def main() -> None:
         weight_decay=1e-4,
     )
 
-    best_val_acc, best_val_loss = trainer.train(
+    best_val_f1, best_val_loss = trainer.train(
         train_loader=train_loader,
         val_loader=val_loader,
-        epochs=10,
+        epochs=3,
         save_path="best_audio_transformer.pth",
     )
 
