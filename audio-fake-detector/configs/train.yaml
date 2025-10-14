@@ -1,0 +1,55 @@
+seed: 42
+
+data:
+  train_csv: ../dataset/train.csv
+  val_csv: null
+  audio_dir: ../dataset/train
+  sample_rate: 16000
+  audio_column: audio_name
+  target_column: target
+  num_workers: 12
+  crop:
+    enable: true
+    min_sec: 3.0
+    max_sec: 5.0
+    train_mode: random
+    eval_mode: center
+    apply_to_validation: true
+  stratified_split:
+    enable: true
+    val_ratio: 0.1
+    test_ratio: 0.1
+  limit_samples: null
+
+model:
+  type: wavlm  # options: wavlm, cnn_melspec
+  wavlm:
+    pretrained_name: microsoft/wavlm-base-plus
+    freeze_encoder: false
+    dropout: 0.1
+  cnn_melspec:
+    n_mels: 128
+    n_fft: 1024
+    hop_length: 320
+    dropout: 0.2
+
+training:
+  output_dir: outputs
+  batch_size: 8
+  epochs: 10
+  min_epochs: 2
+  patience: 3
+  amp: true
+  accumulation_steps: 1
+  grad_clip: 1.0
+  weight_decay: 0.01
+  encoder_lr: 3.0e-5
+  head_lr: 1.0e-3
+  checkpoint_name: best.ckpt
+  resume_from: null
+
+post_training:
+  run_prediction: true
+  predict_config: configs/predict.yaml
+  csv: ../dataset/test.csv
+  out: outputs/predictions.csv
