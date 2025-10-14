@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 import torch
@@ -43,6 +43,7 @@ class AudioDeepfakeDataset(Dataset):
         crop_min_sec: float = 3.0,
         crop_max_sec: float = 5.0,
         crop_mode: str = "random",  # options: random, center
+        rawboost_cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.df = data.reset_index(drop=True)
         self.audio_dir = Path(audio_dir) if audio_dir is not None else None
@@ -58,6 +59,8 @@ class AudioDeepfakeDataset(Dataset):
             raise ValueError("crop_max_sec must be >= crop_min_sec.")
         self.crop_mode = crop_mode
 
+        self.rawboost = self._init_rawboost(rawboost_cfg)
+
     def __len__(self) -> int:
         return len(self.df)
 
@@ -68,6 +71,7 @@ class AudioDeepfakeDataset(Dataset):
         waveform = load_audio(audio_path, sample_rate=self.sample_rate)
 
         waveform, length = self._crop_waveform(waveform)
+        waveform = self._apply_rawboost(waveform)
 
         label = int(row[self.target_column]) if self.has_labels else None
         return Sample(waveform=waveform, length=length, label=label, name=str(audio_name))
@@ -104,6 +108,33 @@ class AudioDeepfakeDataset(Dataset):
             length = waveform.size(0)
 
         return cropped, length
+
+    def _init_rawboost(self, cfg: Optional[Dict[str, Any]]):
+        if not cfg or not cfg.get("enable", False):
+            return None
+        probability = float(cfg.get("probability", 0.5))
+        algo = int(cfg.get("algo", 4))
+        overrides = cfg.get("parameters")
+        if overrides is not None and not isinstance(overrides, dict):
+            raise TypeError("RawBoost parameters must be provided as a mapping.")
+        try:
+            from src.utils.augment import RawBoostAugmentor
+        except ImportError as exc:
+            raise ImportError(
+                "RawBoost augmentation requested but SciPy is not available. "
+                "Install SciPy or disable RawBoost."
+            ) from exc
+        return RawBoostAugmentor.from_config(
+            sample_rate=self.sample_rate,
+            algo=algo,
+            probability=probability,
+            overrides=overrides,
+        )
+
+    def _apply_rawboost(self, waveform: torch.Tensor) -> torch.Tensor:
+        if self.rawboost is None:
+            return waveform
+        return self.rawboost(waveform)
 
 
 def collate_audio_samples(batch: Iterable[Sample]) -> dict:

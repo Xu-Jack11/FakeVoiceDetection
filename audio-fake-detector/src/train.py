@@ -109,6 +109,11 @@ def build_dataloaders(cfg: Dict, train_df: pd.DataFrame, val_df: pd.DataFrame) -
                     "crop_mode": crop_cfg.get("eval_mode", "center"),
                 }
             )
+    rawboost_cfg = data_cfg.get("rawboost")
+    if rawboost_cfg and rawboost_cfg.get("enable", False):
+        train_kwargs["rawboost_cfg"] = rawboost_cfg
+        if rawboost_cfg.get("apply_to_validation", False):
+            val_kwargs["rawboost_cfg"] = rawboost_cfg
     train_dataset = AudioDeepfakeDataset(
         data=train_df,
         audio_dir=train_audio_dir,

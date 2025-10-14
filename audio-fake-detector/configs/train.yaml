@@ -15,6 +15,12 @@ data:
     train_mode: random
     eval_mode: center
     apply_to_validation: true
+  rawboost:
+    enable: true
+    probability: 0.5
+    algo: 4
+    apply_to_validation: false
+    parameters: {}
   stratified_split:
     enable: true
     val_ratio: 0.1
