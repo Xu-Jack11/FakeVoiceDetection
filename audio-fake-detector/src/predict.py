@@ -122,6 +122,11 @@ def run_prediction(
         f"(CSV={csv_resolved}) using checkpoint {checkpoint_resolved}"
     )
 
+    # Adjustable threshold for prediction (default: 0.5)
+    # Lower threshold (e.g., 0.4): more samples classified as Real (1)
+    # Higher threshold (e.g., 0.6): more samples classified as AI (0)
+    decision_threshold = cfg.get("decision_threshold", 0.5)
+    
     audio_names, scores, preds = [], [], []
     with torch.no_grad():
         pbar = tqdm(dataloader, desc="Predict", leave=True, dynamic_ncols=True)
@@ -131,7 +136,7 @@ def run_prediction(
             logits = model(inputs, attention_mask=attn)
             probabilities = torch.softmax(logits, dim=1)
             score_ai = probabilities[:, 0]
-            prediction = (score_ai < 0.5).long()
+            prediction = (score_ai < decision_threshold).long()
             audio_names.extend(batch["audio_names"])
             scores.extend(score_ai.cpu().tolist())
             preds.extend(prediction.cpu().tolist())
@@ -140,8 +145,7 @@ def run_prediction(
     output_df = pd.DataFrame(
         {
             "audio_name": audio_names,
-            "score_ai": scores,
-            "pred": preds,
+            "target": preds,
         }
     )
     out_resolved.parent.mkdir(parents=True, exist_ok=True)

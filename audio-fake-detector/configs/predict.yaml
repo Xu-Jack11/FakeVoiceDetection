@@ -13,13 +13,18 @@ data:
   sample_rate: 16000
   audio_dir: ../dataset/test
   audio_column: audio_name
-  num_workers: 4
-  batch_size: 8
+  num_workers: 8
+  batch_size: 16
   crop:
     enable: true
     min_sec: 3.0
     max_sec: 5.0
-    mode: center
+    mode: center  # Options: 'center', 'random', 'start', 'end'
+    
+# Decision threshold for classification (default: 0.5)
+# - Lower (e.g., 0.4-0.45): classify more samples as Real (class 1)
+# - Higher (e.g., 0.55-0.6): classify more samples as AI (class 0)
+decision_threshold: 0.45
 
 output:
   path: predictions.csv
